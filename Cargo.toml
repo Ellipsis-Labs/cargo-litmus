@@ -1,0 +1,59 @@
+[package]
+authors       = ["Ellipsis Labs Team", "Brenden Matthews <brenden@brndn.io>"]
+categories    = ["development-tools::cargo-plugins", "development-tools::testing"]
+description   = "Conservatively select affected Rust tests from Git changes"
+documentation = "https://docs.rs/cargo-litmus"
+edition       = "2024"
+homepage      = "https://github.com/Ellipsis-Labs/cargo-litmus"
+keywords      = ["cargo", "testing", "ci", "monorepo", "nextest"]
+license       = "MIT"
+name          = "cargo-litmus"
+readme        = "README.md"
+repository    = "https://github.com/Ellipsis-Labs/cargo-litmus"
+rust-version  = "1.88.0"
+version       = "0.1.0"
+
+[lib]
+name = "cargo_litmus"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cargo-litmus"
+path = "src/main.rs"
+
+[dependencies]
+blake3         = { version = "1.8.5", features = ["rayon", "mmap"] }
+cargo_metadata = "0.23"
+clap           = { version = "4.6", features = ["derive", "cargo", "env"] }
+git2           = "0.21"
+globset        = "0.4"
+miette         = { version = "7.6", features = ["fancy"] }
+petgraph       = "0.8"
+proc-macro2    = { version = "1.0", features = ["span-locations"] }
+rayon          = "1.12"
+rkyv           = { version = "0.8.18", features = ["std", "alloc"] }
+serde          = { version = "1.0", features = ["derive"] }
+serde_json     = "1.0"
+syn            = { version = "3.0", features = ["full", "extra-traits", "visit"] }
+thiserror      = "2.0"
+toml           = "1.1"
+walkdir        = "2.5"
+
+[dev-dependencies]
+assert_cmd = "2.1"
+assert_fs  = "1.1"
+predicates = "3.1"
+tempfile   = "3.27"
+
+[profile.ci]
+debug    = "line-tables-only"
+inherits = "dev"
+
+[profile.release]
+codegen-units = 1
+lto           = true
+
+[package.metadata.binstall]
+bin-dir = "{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ version }-{ target }.tar.gz"

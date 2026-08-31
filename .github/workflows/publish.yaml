@@ -1,0 +1,149 @@
+name: Publish to crates.io
+
+on:
+  push:
+    tags:
+      - v*
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/rust-cache
+        with:
+          cache-name: publish-test
+      - uses: ./.github/actions/cargo-binstall
+        with:
+          binaries: cargo-nextest cargo-hold
+      - run: cargo hold voyage
+      - run: cargo nextest run --locked --profile ci
+
+  cross-build:
+    needs: [test]
+    uses: ./.github/workflows/cross-build.yaml
+    secrets:
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      NIX_SIGNING_KEY: ${{ secrets.NIX_SIGNING_KEY }}
+
+  publish:
+    runs-on: ubuntu-latest
+    needs: [cross-build]
+    permissions:
+      contents: write
+      discussions: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Select crates.io authentication method
+        id: auth-mode
+        env:
+          CRATES_IO_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: |
+          if [[ -n "$CRATES_IO_TOKEN" ]]; then
+            echo "method=api-token" >> "$GITHUB_OUTPUT"
+          else
+            echo "method=trusted-publishing" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Authenticate with crates.io using trusted publishing
+        id: auth
+        if: steps.auth-mode.outputs.method == 'trusted-publishing'
+        uses: rust-lang/crates-io-auth-action@v1
+
+      - name: Publish initial release using API token
+        if: steps.auth-mode.outputs.method == 'api-token'
+        run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+
+      - name: Publish using trusted publishing
+        if: steps.auth-mode.outputs.method == 'trusted-publishing'
+        run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+
+      - name: Prepare release assets
+        run: |
+          cd artifacts
+
+          # Extract version from the git tag (remove 'v' prefix)
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          echo "Version: $VERSION"
+
+          # Map artifact directory names to Rust target triples
+          declare -A target_map=(
+            ["x86_64-linux"]="x86_64-unknown-linux-musl"
+            ["aarch64-linux"]="aarch64-unknown-linux-musl"
+            ["x86_64-darwin"]="x86_64-apple-darwin"
+            ["aarch64-darwin"]="aarch64-apple-darwin"
+          )
+
+          # Create compressed archives for each platform
+          for arch_dir in cargo-litmus-*; do
+            if [ -d "$arch_dir" ]; then
+              arch_name="${arch_dir#cargo-litmus-}"
+              rust_target="${target_map[$arch_name]}"
+
+              if [ -z "$rust_target" ]; then
+                echo "Warning: Unknown architecture mapping for $arch_name"
+                rust_target="$arch_name"
+              fi
+
+              # Move into directory and get the binary
+              cd "$arch_dir"
+
+              # The binary is named cargo-litmus
+              if [ -f "cargo-litmus" ]; then
+                # Create a tar.gz archive with the binary using cargo-binstall naming
+                tar -czf "../cargo-litmus-${VERSION}-${rust_target}.tar.gz" cargo-litmus
+                echo "Created cargo-litmus-${VERSION}-${rust_target}.tar.gz"
+              else
+                echo "Warning: Binary not found in $arch_dir"
+              fi
+
+              cd ..
+            fi
+          done
+
+          # Generate checksums for all archives
+          echo "Generating checksums..."
+          sha256sum -- *.tar.gz > cargo-litmus-checksums-sha256.txt
+
+          # List all created files
+          echo "Release assets:"
+          ls -la -- *.tar.gz cargo-litmus-checksums-sha256.txt
+
+      - name: Generate artifact attestation
+        uses: actions/attest@v4
+        with:
+          subject-path: artifacts/*.tar.gz
+
+      - name: Create Release
+        id: create_release
+        uses: softprops/action-gh-release@v3
+        if: github.ref_type == 'tag'
+        with:
+          draft: false
+          prerelease: false
+          discussion_category_name: General
+          generate_release_notes: true
+          files: |
+            artifacts/*.tar.gz
+            artifacts/cargo-litmus-checksums-sha256.txt
