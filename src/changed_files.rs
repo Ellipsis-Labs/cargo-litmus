@@ -126,17 +126,19 @@ impl ChangeSet {
     /// changes.
     pub fn worktree(root: &Path) -> Result<Self> {
         let repo = open_repository(root)?;
-        let mut files = Self::staged(root)?.files;
+        let head_tree = head_tree(&repo)?;
         let mut options = DiffOptions::new();
         options
             .include_untracked(true)
             .recurse_untracked_dirs(true)
             .include_typechange(true);
-        let diff = repo.diff_index_to_workdir(None, Some(&mut options))?;
-        files.extend(changed_files_from_diff(diff)?);
+        // One HEAD->worktree diff, not staged plus index->worktree merged: those
+        // two number lines against different blobs, so a staged hunk's range is
+        // only valid until an unstaged edit above it shifts the file.
+        let diff = repo.diff_tree_to_workdir_with_index(head_tree.as_ref(), Some(&mut options))?;
         Ok(Self {
             source: ChangeSource::Worktree,
-            files: merge_changed_file_inputs(files),
+            files: changed_files_from_diff(diff)?,
         })
     }
 }
@@ -559,6 +561,48 @@ mod tests {
         assert_eq!(
             paths,
             vec!["src/staged.rs", "src/unstaged.rs", "src/untracked.rs"]
+        );
+    }
+
+    #[test]
+    fn worktree_ranges_track_the_working_tree_after_an_unstaged_shift() {
+        // A staged edit is numbered against the index. An unstaged insert above it
+        // moves it in the working tree, which is the file the index is built from,
+        // so the reported range has to follow it or the selector narrows onto
+        // unrelated lines and skips the tests that cover the staged change.
+        let original = (1..=20)
+            .map(|i| format!("pub fn f{i}() {{}}\n"))
+            .collect::<String>();
+        let repo = committed_repo(&[("src/a.rs", original.as_str())]);
+
+        let staged = original.replace("pub fn f15() {}", "pub fn f15() { todo!() }");
+        fs::write(repo.path().join("src/a.rs"), &staged).unwrap();
+        let git = Repository::open(repo.path()).unwrap();
+        let mut index = git.index().unwrap();
+        index.add_path(Path::new("src/a.rs")).unwrap();
+        index.write().unwrap();
+
+        let prefix = (1..=40)
+            .map(|i| format!("pub fn pre{i}() {{}}\n"))
+            .collect::<String>();
+        fs::write(repo.path().join("src/a.rs"), format!("{prefix}{staged}")).unwrap();
+
+        let changes = ChangeSet::worktree(repo.path()).unwrap();
+        let file = changes
+            .files
+            .iter()
+            .find(|file| file.path == "src/a.rs")
+            .expect("changed file is reported");
+
+        // f15 moved from line 15 to line 55 behind the 40 prepended lines.
+        assert!(
+            file.ranges.is_empty()
+                || file
+                    .ranges
+                    .iter()
+                    .any(|range| range.start_line <= 55 && 55 <= range.end_line),
+            "worktree ranges {:?} do not cover the staged change at working-tree line 55",
+            file.ranges
         );
     }
 
