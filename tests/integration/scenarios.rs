@@ -13,11 +13,9 @@
 //! reverse-transitive dependency closure upstream ferris-wheel computes, so
 //! failures point at litmus's own narrowing and widening logic.
 
-mod support;
-
 use std::fs;
 
-use support::{
+use crate::support::{
     CommandExpectation, CommandMode, Expect, FerrisCrate, FerrisPayload, FerrisWorkspace, Monorepo,
     check, check_with_ferris, check_with_wrapped_cargo, create, delete, edit, pkg, rename, target,
     ws,

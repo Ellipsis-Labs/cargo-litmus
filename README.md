@@ -134,11 +134,19 @@ cargo audit
 
 ### Scenario tests
 
-`tests/scenarios.rs` covers selection accuracy end to end. Each scenario synthesizes a
-multi-workspace Cargo monorepo in a temporary Git repository, builds a base index,
-commits a change, and runs the real `cargo-litmus affected` binary against it;
-`tests/support/mod.rs` provides the monorepo builders and scripts `cargo-ferris-wheel`
-deterministically, so the suite needs no installed ferris-wheel.
+`tests/integration/scenarios.rs` covers selection accuracy end to end. Each scenario
+synthesizes a multi-workspace Cargo monorepo in a temporary Git repository, builds a
+base index, commits a change, and runs the real `cargo-litmus affected` binary against
+it; the harness in `tests/integration/support/` provides the monorepo builders and
+scripts `cargo-ferris-wheel` deterministically, so the suite needs no installed
+ferris-wheel. The harness is split by concern: `monorepo.rs` (synthesis DSL and git
+plumbing), `ferris.rs` (shim and payload model), `report.rs` (test-side mirror of the
+JSON contract), `expectations.rs` (two-sided expectations and diagnostics),
+`scenario.rs` (the `check*` drivers), and `env.rs` (`PATH`/binary resolution).
+
+`tests/integration/main.rs` is the only integration-test root: Cargo compiles every
+top-level file in `tests/` into its own executable, so the suites and the harness live
+under one root to keep the harness compiled once and its dead-code analysis global.
 
 Scenario expectations are two-sided: `required` packages fail the run when they are
 missing (a false negative) and `allowed` packages fail the run when they are exceeded
