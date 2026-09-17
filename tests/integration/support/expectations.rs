@@ -19,6 +19,7 @@ pub struct Expect {
     allowed: BTreeSet<String>,
     required_commands: Vec<CommandExpectation>,
     forbid_global_fail_wide: bool,
+    require_global_fail_wide: bool,
     note: Option<String>,
 }
 
@@ -53,6 +54,7 @@ impl Expect {
             allowed: set,
             required_commands: Vec::new(),
             forbid_global_fail_wide: false,
+            require_global_fail_wide: false,
             note: None,
         }
     }
@@ -64,6 +66,13 @@ impl Expect {
 
     pub fn forbid_global_fail_wide(mut self) -> Self {
         self.forbid_global_fail_wide = true;
+        self
+    }
+
+    /// The change has no provable owner, so the sanctioned fallback is to run
+    /// every workspace. Pinning it keeps a future narrowing honest.
+    pub fn require_global_fail_wide(mut self) -> Self {
+        self.require_global_fail_wide = true;
         self
     }
 
@@ -117,9 +126,36 @@ pub(crate) fn assert_expectations(
             "over-selection: package {extra} is covered but not allowed"
         ));
     }
+    let mut seen_workspaces = BTreeSet::new();
+    for selection in &report.test_workspace_selections {
+        if !seen_workspaces.insert(selection.workspace.name.clone()) {
+            violations.push(format!(
+                "duplicate workspace selection: {} is reported more than once",
+                selection.workspace.name
+            ));
+        }
+    }
+    let mut seen_commands = BTreeSet::new();
+    for command in &report.nextest_commands {
+        if command.mode != CommandMode::WorkspaceWide {
+            continue;
+        }
+        if !seen_commands.insert(command.workspace.clone()) {
+            violations.push(format!(
+                "duplicate workspace-wide command: workspace={} appears more than once",
+                command.workspace
+            ));
+        }
+    }
     if expect.forbid_global_fail_wide && report.failed_wide {
         violations.push(format!(
             "unexpected global fail-wide: {}",
+            report.selection_reason
+        ));
+    }
+    if expect.require_global_fail_wide && !report.failed_wide {
+        violations.push(format!(
+            "expected global fail-wide but selection was narrow: {}",
             report.selection_reason
         ));
     }

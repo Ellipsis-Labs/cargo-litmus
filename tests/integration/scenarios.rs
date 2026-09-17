@@ -307,11 +307,14 @@ fn unmapped_file_outside_workspaces_stays_conservative() {
     check(
         "unmapped_file_outside_workspaces_stays_conservative",
         monorepo,
-        &[create("docs/notes.md", "release notes\n")],
-        &Expect::exact(&[target("core/math"), target("sdk/state")]).note(
-            "a file outside every workspace has no provable owner; widening to all workspaces is \
-             the sanctioned conservative fallback (false negatives are never acceptable)",
-        ),
+        &[create("configs/market.toml", "tick_size = 1\n")],
+        &Expect::exact(&[target("core/math"), target("sdk/state")])
+            .require_global_fail_wide()
+            .note(
+                "a data file outside every workspace has no provable owner and can be read at \
+                 runtime; widening to all workspaces is the sanctioned conservative fallback \
+                 (false negatives are never acceptable)",
+            ),
     );
 }
 
@@ -735,5 +738,282 @@ fn scripted_ferris_under_report_is_repaired_from_index_closure() {
              selected without widening the workspace",
         ),
         Some(payload),
+    );
+}
+
+/// ferris-wheel reports no packages for a workspace-level file, so the
+/// workspace itself is the only owner litmus can recover. That owner must come
+/// from the index, not from ferris's (empty) affected-workspace list.
+#[test]
+fn workspace_lockfile_change_without_ferris_signal_stays_in_own_workspace() {
+    let monorepo = Monorepo::new(vec![
+        ws("core").package(pkg("math")),
+        ws("sdk")
+            .lockfile()
+            .package(pkg("state").dep_at("math", "../../core/math")),
+    ]);
+    let lockfile =
+        fs::read_to_string(monorepo.root().join("sdk/Cargo.lock")).expect("read lockfile");
+    let changed_lockfile = lockfile.replace(
+        "name = \"state\"\nversion = \"0.1.0\"",
+        "name = \"state\"\nversion = \"0.1.1\"",
+    );
+    assert_ne!(
+        lockfile, changed_lockfile,
+        "lockfile bump must change content"
+    );
+    check(
+        "workspace_lockfile_change_without_ferris_signal_stays_in_own_workspace",
+        monorepo,
+        &[edit("sdk/Cargo.lock", &changed_lockfile)],
+        &Expect::exact(&[target("sdk/state")])
+            .require_command(CommandExpectation::new("sdk", CommandMode::WorkspaceWide))
+            .forbid_global_fail_wide()
+            .note(
+                "a workspace lockfile has no owning package; widening must stay inside that \
+                 workspace even when ferris reports nothing for it",
+            ),
+    );
+}
+
+#[test]
+fn workspace_data_file_change_without_ferris_signal_stays_in_own_workspace() {
+    let monorepo = Monorepo::new(vec![
+        ws("core").package(pkg("math")),
+        ws("sdk")
+            .file("db/migrations/0001_init.sql", "select 1;\n")
+            .package(pkg("state").dep_at("math", "../../core/math")),
+    ]);
+    check(
+        "workspace_data_file_change_without_ferris_signal_stays_in_own_workspace",
+        monorepo,
+        &[edit("sdk/db/migrations/0001_init.sql", "select 2;\n")],
+        &Expect::exact(&[target("sdk/state")])
+            .require_command(CommandExpectation::new("sdk", CommandMode::WorkspaceWide))
+            .forbid_global_fail_wide()
+            .note(
+                "a workspace-level data file has no owning package; the containing workspace is \
+                 the narrowest owner the index can prove",
+            ),
+    );
+}
+
+#[test]
+fn documentation_change_outside_workspaces_selects_nothing() {
+    let monorepo = Monorepo::new(vec![ws("core").package(pkg("math"))]);
+    check(
+        "documentation_change_outside_workspaces_selects_nothing",
+        monorepo,
+        &[create("docs/notes.md", "release notes\n")],
+        &Expect::exact::<&str>(&[]).forbid_global_fail_wide().note(
+            "prose cannot be compiled, executed, or read by a build without an indexed include \
+             relationship",
+        ),
+    );
+}
+
+#[test]
+fn documentation_change_does_not_widen_a_rust_change() {
+    let monorepo = Monorepo::new(vec![
+        ws("core").package(pkg("math")),
+        ws("sdk")
+            .package(pkg("state").dep_at("math", "../../core/math"))
+            .package(pkg("unrelated")),
+    ]);
+    check(
+        "documentation_change_does_not_widen_a_rust_change",
+        monorepo,
+        &[
+            edit("core/math/src/lib.rs", "pub fn math() -> u32 { 2 }\n"),
+            create("docs/notes.md", "release notes\n"),
+            create("sdk/README.md", "sdk docs\n"),
+        ],
+        &Expect::exact(&[target("core/math"), target("sdk/state")])
+            .forbid_global_fail_wide()
+            .note(
+                "documentation, including a README inside a workspace, must not add workspaces or \
+                 packages beyond the Rust change's closure",
+            ),
+    );
+}
+
+#[test]
+fn ci_metadata_change_does_not_widen_a_rust_change() {
+    let monorepo = Monorepo::new(vec![
+        ws("core").package(pkg("math")),
+        ws("sdk")
+            .package(pkg("state").dep_at("math", "../../core/math"))
+            .package(pkg("unrelated")),
+    ]);
+    check(
+        "ci_metadata_change_does_not_widen_a_rust_change",
+        monorepo,
+        &[
+            edit("core/math/src/lib.rs", "pub fn math() -> u32 { 2 }\n"),
+            create(".github/workflows/ci.yaml", "name: ci\n"),
+            create(".agents/skills/review/SKILL.md", "# review\n"),
+        ],
+        &Expect::exact(&[target("core/math"), target("sdk/state")])
+            .forbid_global_fail_wide()
+            .note("CI and agent metadata are never read by a Rust build or test"),
+    );
+}
+
+#[test]
+fn configured_ignore_rule_marks_repo_specific_paths_inert() {
+    let monorepo = Monorepo::new(vec![
+        ws("core").package(pkg("math")),
+        ws("sdk")
+            .package(pkg("state").dep_at("math", "../../core/math"))
+            .package(pkg("unrelated")),
+    ]);
+    monorepo.write(
+        ".cargo-litmus.toml",
+        "[[rules]]\npaths = [\"ts/**\"]\nselection = \"ignore\"\n",
+    );
+    check(
+        "configured_ignore_rule_marks_repo_specific_paths_inert",
+        monorepo,
+        &[
+            edit("core/math/src/lib.rs", "pub fn math() -> u32 { 2 }\n"),
+            create("ts/app.ts", "export const x = 1;\n"),
+        ],
+        &Expect::exact(&[target("core/math"), target("sdk/state")])
+            .forbid_global_fail_wide()
+            .note(
+                "an ignore rule, and the configuration file itself, must not widen selection or \
+                 disable narrowing",
+            ),
+    );
+}
+
+#[test]
+fn configured_ignore_rule_keeps_module_narrowing() {
+    let base_lib = "pub fn adds(left: u32, right: u32) -> u32 {\n    left + \
+                    right\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    #[test]\n    \
+                    fn adds_numbers() {\n        assert_eq!(adds(1, 2), 3);\n    }\n}\n";
+    let changed_lib =
+        "pub fn adds(left: u32, right: u32) -> u32 {\n    left + right\n}\n\n#[cfg(test)]\nmod \
+         tests {\n    use super::*;\n\n    #[test]\n    fn adds_numbers() {\n        \
+         assert_eq!(adds(1, 2), 3);\n    }\n\n    #[test]\n    fn adds_zero() {\n        \
+         assert_eq!(adds(0, 0), 0);\n    }\n}\n";
+    let monorepo = Monorepo::new(vec![
+        ws("core").package(pkg("math").lib_source(base_lib)),
+        ws("sdk")
+            .package(pkg("state").dep_at("math", "../../core/math"))
+            .package(pkg("unrelated")),
+    ]);
+    monorepo.write(
+        ".cargo-litmus.toml",
+        "[[rules]]\npaths = [\"ts/**\"]\nselection = \"ignore\"\n",
+    );
+    check(
+        "configured_ignore_rule_keeps_module_narrowing",
+        monorepo,
+        &[
+            edit("core/math/src/lib.rs", changed_lib),
+            create("ts/app.ts", "export const x = 1;\n"),
+        ],
+        &Expect::exact(&[target("core/math")])
+            .require_command(CommandExpectation::new("core", CommandMode::Module).package("math"))
+            .forbid_global_fail_wide()
+            .note(
+                "an ignore rule cannot force the ferris closure; the test-module change must stay \
+                 a module filter",
+            ),
+    );
+}
+
+#[test]
+fn package_readme_change_keeps_package_closure() {
+    let monorepo = Monorepo::new(vec![
+        ws("core")
+            .package(pkg("math").file("README.md", "math notes\n"))
+            .package(pkg("app").dep("math")),
+    ]);
+    check(
+        "package_readme_change_keeps_package_closure",
+        monorepo,
+        &[edit("core/math/README.md", "math notes, revised\n")],
+        &Expect::exact(&[target("core/math"), target("core/app")])
+            .forbid_global_fail_wide()
+            .note(
+                "a file beneath a package root stays conservative: package code can read it \
+                 through paths litmus cannot index (CARGO_MANIFEST_DIR, computed paths), so the \
+                 owning package's closure remains the answer",
+            ),
+    );
+}
+
+#[test]
+fn mixed_change_widens_each_file_to_its_own_owner() {
+    let monorepo = Monorepo::new(vec![
+        ws("core").package(pkg("math")),
+        ws("sdk").package(pkg("state").dep_at("math", "../../core/math")),
+        ws("tools")
+            .file("db/schema.sql", "select 1;\n")
+            .package(pkg("cli")),
+    ]);
+    check(
+        "mixed_change_widens_each_file_to_its_own_owner",
+        monorepo,
+        &[
+            edit("core/math/src/lib.rs", "pub fn math() -> u32 { 2 }\n"),
+            edit("tools/db/schema.sql", "select 2;\n"),
+        ],
+        &Expect::exact(&[
+            target("core/math"),
+            target("sdk/state"),
+            target("tools/cli"),
+        ])
+        .require_command(CommandExpectation::new("tools", CommandMode::WorkspaceWide))
+        .forbid_global_fail_wide()
+        .note(
+            "a workspace-level data file must widen its own workspace even when ferris reports \
+             only the Rust change's workspaces; partial mapping must not fail wide",
+        ),
+    );
+}
+
+#[test]
+fn nested_cargo_config_stays_conservative() {
+    let monorepo = Monorepo::new(vec![
+        ws("core").package(pkg("math")),
+        ws("sdk").package(pkg("state").dep_at("math", "../../core/math")),
+    ]);
+    monorepo.write("sdk/.cargo/config.toml", "[build]\nrustflags = []\n");
+    check(
+        "nested_cargo_config_stays_conservative",
+        monorepo,
+        &[edit(
+            "sdk/.cargo/config.toml",
+            "[build]\nrustflags = [\"-Copt-level=2\"]\n",
+        )],
+        &Expect::exact(&[target("core/math"), target("sdk/state")])
+            .require_global_fail_wide()
+            .note(
+                "Cargo configuration resolves by walking up the directory tree and can be merged \
+                 with ancestors, so it widens every workspace rather than one owner",
+            ),
+    );
+}
+
+#[test]
+fn default_inert_paths_disabled_keeps_documentation_conservative() {
+    let monorepo = Monorepo::new(vec![
+        ws("core").package(pkg("math")),
+        ws("sdk").package(pkg("state").dep_at("math", "../../core/math")),
+    ]);
+    monorepo.write(".cargo-litmus.toml", "default-inert-paths = false\n");
+    check(
+        "default_inert_paths_disabled_keeps_documentation_conservative",
+        monorepo,
+        &[create("docs/notes.md", "release notes\n")],
+        &Expect::exact(&[target("core/math"), target("sdk/state")])
+            .require_global_fail_wide()
+            .note(
+                "with the built-in classes disabled, an unmapped file widens to every workspace \
+                 again",
+            ),
     );
 }

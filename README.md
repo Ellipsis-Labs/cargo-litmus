@@ -89,6 +89,35 @@ cargo litmus affected \
 
 `LITMUS_BASE_CACHE` provides the default `--base-cache` path. Cache metadata includes the repository root and source/Cargo fingerprints; incompatible or incomplete caches are rebuilt conservatively.
 
+## How inputs select tests
+
+Litmus classifies every changed file, in this order:
+
+1. **Configured inputs** (`.cargo-litmus.toml`) select the workspaces or packages they name.
+2. **Cargo inputs** (`Cargo.toml`, `Cargo.lock`, `build.rs`, `.cargo/config.toml`, `rust-toolchain.toml`) select their owning package's closure, their workspace, or every workspace for configuration and toolchain files, which resolve by walking up the directory tree.
+3. **Indexed sources** map to their owning package and reverse dependents. Files embedded with `include!`, `include_str!`, `include_bytes!`, or `#[path]` map to the packages that embed them.
+4. **Inert inputs** select nothing and are not passed to `cargo-ferris-wheel`, whose ripple walk widens on files it cannot map. Documentation, media, fonts, legal and community files, container recipes, and CI, agent, and editor metadata cannot be compiled, executed, or read by a build unless an indexed source embeds them, which case 3 already covers. Inert classification stops at package roots: a file beneath a package root keeps its package's closure, because package code can read it through paths litmus cannot index (`CARGO_MANIFEST_DIR`, computed paths).
+5. **Any other file** is conservative: a file beneath a package root selects that package and its reverse dependents; a file inside a workspace but outside its packages (lockfile, workspace manifest, workspace data) widens to that workspace; a file outside every workspace widens to all of them.
+
+The built-in inert classes are:
+
+| class | examples |
+|---|---|
+| documentation and media | `*.md`, `*.mdx`, `*.rst`, `*.adoc`, `*.png`, `*.svg`, `*.pdf`, `*.woff2` |
+| legal and community | `LICENSE*`, `COPYING*`, `NOTICE*`, `CHANGELOG*`, `CONTRIBUTING*`, `SECURITY*`, `CODEOWNERS` |
+| CI, agent, and editor metadata | `.github/**`, `.agents/**`, `.claude/**`, `.cursor/**`, `.devcontainer/**`, `.vscode/**`, `.idea/**` |
+| container recipes | `Dockerfile*`, `*.dockerfile`, `.dockerignore`, `docker-compose*.yml` |
+
+Data and configuration files (`*.toml`, `*.yaml`, `*.json`, `*.sql`, `*.snap`, scripts, templates) are never inert, because a build or test can read them at runtime. Declare them with `.cargo-litmus.toml` rules, or add `selection = "ignore"` rules for repository-specific trees that cannot affect tests:
+
+```toml
+[[rules]]
+paths = ["ts/**", "dev-docs/**"]
+selection = "ignore"
+```
+
+Set `default-inert-paths = false` to disable the built-in classes and make every unmapped file conservative again. `--format json` reports every classification in `input_explanations`, including inert ones.
+
 ## Repository-specific inputs
 
 Rust syntax and Cargo metadata cannot express every input to a build or test. Add `.cargo-litmus.toml` at the analyzed repository root to map migrations, schemas, generated inputs, or other files explicitly:
@@ -104,12 +133,16 @@ paths = ["schemas/**"]
 packages = ["api-types", "api-server"]
 selection = "packages"
 
+[[rules]]
+paths = ["vendor/tooling/**"]
+selection = "ignore"
+
 [[build-script-inputs]]
 paths = ["codegen/**"]
 packages = ["generated-client"]
 ```
 
-Rules are strict: unknown fields, invalid globs, and empty required selections are errors. Inputs that remain unmapped widen selection rather than being ignored.
+Rules are strict: unknown fields, invalid globs, and empty or contradictory selections are errors. Inputs that remain unmapped and are not classified inert widen selection rather than being ignored.
 
 ## Optional nextest validation
 
