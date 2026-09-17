@@ -13,7 +13,7 @@
 - `cargo clippy --all-targets -- -D warnings`: Enforce lint-clean code.
 - `cargo +nightly-2025-07-08 fmt --check`: Verify the repository's Rust formatting.
 - `cargo deny check` and `cargo audit`: Check licenses, bans, and advisories.
-- `cargo hold voyage`: Prepare and verify the shared Cargo cache before local CI-equivalent checks.
+- `mbx <cargo args>`: Run Cargo through mr boxington with the same caching as CI, for example `mbx check --locked --all-targets`.
 
 ## Coding Style & Safety Invariants
 
