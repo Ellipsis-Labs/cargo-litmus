@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-`cargo-litmus` is a Rust Cargo subcommand for conservative affected-test selection. The CLI entrypoint is `src/main.rs`, with clap parsing and output in `src/cli.rs`. Index construction and persistence live in `src/indexer.rs`, `src/parser.rs`, `src/model.rs`, and `src/storage.rs`. Selection logic is in `src/affected.rs`; Git change discovery, Cargo graph inspection, external `cargo-ferris-wheel` integration, optional nextest validation, and repository rules are split across their correspondingly named modules. Integration coverage lives in `tests/index_cli.rs`, and the default index is written to `target/cargo-litmus.rkyv`.
+`cargo-litmus` is a Rust Cargo subcommand for conservative affected-test selection. The CLI entrypoint is `src/main.rs`, with clap parsing and output in `src/cli.rs`. Index construction and persistence live in `src/indexer.rs`, `src/parser.rs`, `src/model.rs`, and `src/storage.rs`. Selection logic is in `src/affected.rs`; Git change discovery, Cargo graph inspection, external `cargo-ferris-wheel` integration, optional nextest validation, and repository rules are split across their correspondingly named modules. Integration coverage lives in `tests/integration/`, and the default index is written to `target/cargo-litmus.rkyv`.
 
 ## Build, Test, and Development Commands
 
@@ -21,7 +21,7 @@ Use Rust 2024 formatting and keep modules and files snake_case, types UpperCamel
 
 ## Testing Guidelines
 
-Keep focused unit tests beside their implementations and add end-to-end CLI/index scenarios to `tests/index_cli.rs`. Use temporary tracked Git repositories for change-discovery tests. Every selector change needs coverage for the narrow case and its conservative fallback. Tests must not require a developer's existing checkout, cache, or global Git configuration.
+Keep focused unit tests beside their implementations and add end-to-end CLI/index scenarios to `tests/integration/index_cli.rs` (accuracy scenarios go in `tests/integration/scenarios.rs`; both compile into the single `tests/integration/main.rs` binary so the shared harness is compiled once). Use temporary tracked Git repositories for change-discovery tests. Every selector change needs coverage for the narrow case and its conservative fallback. Tests must not require a developer's existing checkout, cache, or global Git configuration.
 
 ## Commit & Pull Request Guidelines
 

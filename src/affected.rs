@@ -36,6 +36,8 @@ const REASON_WORKSPACE_LOCAL_UNCERTAINTY: &str =
     "workspace-local test selection uncertainty; running full workspace tests";
 const REASON_WORKSPACE_INDEX_UNCERTAINTY: &str =
     "one or more changed files in this workspace were not represented in the index";
+const REASON_REPOSITORY_SCOPED_UNCERTAINTY: &str =
+    "Cargo configuration or Rust toolchain files apply to every workspace beneath them";
 
 #[derive(Clone, Debug)]
 pub struct AffectedOptions {
@@ -176,6 +178,9 @@ pub enum InputKind {
     PathModule,
     IncludedSource,
     PackageInput,
+    /// Classified as unable to affect a build or test: documentation, media,
+    /// legal files, or CI, agent, and editor metadata.
+    Inert,
     Uncertain,
 }
 
@@ -412,22 +417,37 @@ fn compute_affected_internal(
         Some(base_metadata) => diff_indexes(base_metadata, current_metadata, &selected_files),
         None => diff_current_index(current_metadata, &selected_files),
     };
-    let mut ferris = match runner.ripples(&options.root, &selected_files) {
-        Ok(ferris) => ferris,
-        Err(_) => {
-            return fail_wide_with_diff(
-                options,
-                runner,
-                diff,
-                Some(current_summary.clone()),
-                "cargo ferris-wheel ripples failed",
-                cache_status,
-                base_reference,
-            );
+    let litmus_config = LitmusConfig::load_optional(&options.root)?;
+    let configured_inputs = litmus_config.matches(selected_files.iter().cloned())?;
+    // An inert file cannot affect a build or test, so it must not reach
+    // ferris-wheel either: upstream widens on files it cannot map, which would
+    // run workspaces no change can reach. An all-inert change selects nothing
+    // and skips the dependency walk entirely.
+    let ferris_files = selected_files
+        .iter()
+        .filter(|path| {
+            inert_input_reason(path, current_metadata, &litmus_config, &configured_inputs).is_none()
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut ferris = if ferris_files.is_empty() {
+        FerrisAffectedReport::default()
+    } else {
+        match runner.ripples(&options.root, &ferris_files) {
+            Ok(ferris) => ferris,
+            Err(_) => {
+                return fail_wide_with_diff(
+                    options,
+                    runner,
+                    diff,
+                    Some(current_summary.clone()),
+                    "cargo-ferris-wheel ripples failed",
+                    cache_status,
+                    base_reference,
+                );
+            }
         }
     };
-    let configured_inputs =
-        LitmusConfig::load_optional(&options.root)?.matches(selected_files.iter().cloned())?;
     apply_configured_inputs(current_metadata, &mut ferris, &configured_inputs)?;
     let input_explanations = explain_inputs(
         &options.root,
@@ -435,6 +455,7 @@ fn compute_affected_internal(
         &mut ferris,
         &changed_file_inputs,
         &configured_inputs,
+        &litmus_config,
     );
     let mapped_paths = input_explanations
         .iter()
@@ -443,20 +464,53 @@ fn compute_affected_internal(
         .collect::<BTreeSet<_>>();
     diff.unknown_files
         .retain(|path| !mapped_paths.contains(path.as_str()));
+    diff.inert_files = input_explanations
+        .iter()
+        .filter(|input| input.kind == InputKind::Inert)
+        .map(|input| input.path.clone())
+        .collect();
+    let selection_inputs = changed_file_inputs
+        .iter()
+        .filter(|file| !diff.inert_files.contains(&file.path))
+        .cloned()
+        .collect::<Vec<_>>();
 
-    let mut workspace_uncertainty = match workspace_uncertainty(
-        &ferris.affected_workspaces,
-        &options.root,
-        &diff.unknown_files,
-    ) {
+    // ferris-wheel reports only packages and their dependents, so a changed
+    // file that belongs to a workspace without belonging to any package
+    // (lockfile, workspace manifest, workspace-level data) has no ferris
+    // signal even though the index knows its owner. Widening that owner is the
+    // narrowest conservative answer; only files outside every indexed
+    // workspace widen all of them.
+    let indexed_workspaces = indexed_workspaces(current_metadata);
+    // `.cargo/config.toml` and `rust-toolchain.toml` resolve by walking up the
+    // directory tree, so they apply to every workspace beneath them rather
+    // than to a single owner.
+    let repository_scoped_uncertainty = input_explanations.iter().any(|input| {
+        input.failed_wide
+            && matches!(
+                input.kind,
+                InputKind::CargoConfig | InputKind::RustToolchain
+            )
+    });
+    let mapped_uncertainty = if repository_scoped_uncertainty {
+        None
+    } else {
+        workspace_uncertainty(&indexed_workspaces, &options.root, &diff.unknown_files)
+    };
+    let mut workspace_uncertainty = match mapped_uncertainty {
         Some(workspace_uncertainty) => workspace_uncertainty,
         None => {
+            let reason = if repository_scoped_uncertainty {
+                REASON_REPOSITORY_SCOPED_UNCERTAINTY
+            } else {
+                "one or more changed files could not be mapped to an affected workspace"
+            };
             let mut report = fail_wide_with_diff(
                 options,
                 runner,
                 diff,
                 Some(current_summary.clone()),
-                "one or more changed files could not be mapped to an affected workspace",
+                reason,
                 cache_status,
                 base_reference,
             )?;
@@ -465,6 +519,13 @@ fn compute_affected_internal(
             return Ok(report);
         }
     };
+    let uncertain_workspaces = indexed_workspaces
+        .iter()
+        .filter(|workspace| workspace_uncertainty.contains_key(&workspace.name))
+        .cloned()
+        .collect();
+    ferris.affected_workspaces =
+        affected_workspaces_with_extra(&ferris.affected_workspaces, uncertain_workspaces);
     for input in &configured_inputs {
         if input.selection == RuleSelection::Workspace {
             for workspace in &input.workspaces {
@@ -481,13 +542,17 @@ fn compute_affected_internal(
     } else {
         REASON_BUILD_FROM_FERRIS_WITH_UNCERTAINTY
     };
-    let mut test_selection = if configured_inputs.is_empty() {
+    let mut test_selection = if configured_inputs
+        .iter()
+        .all(|input| input.selection == RuleSelection::Ignore)
+    {
+        let ferris = exclude_test_only_dependents(current_metadata, &ferris, &diff);
         select_test_crates(
             current_metadata,
             &ferris,
             &diff,
             &workspace_uncertainty,
-            &changed_file_inputs,
+            &selection_inputs,
         )
     } else {
         select_test_crates_with_configured_inputs(
@@ -495,7 +560,7 @@ fn compute_affected_internal(
             &ferris,
             &diff,
             &workspace_uncertainty,
-            &changed_file_inputs,
+            &selection_inputs,
             true,
         )
     };
@@ -591,6 +656,9 @@ fn apply_configured_inputs(
                     }
                 }
             }
+            // Ignore rules select nothing and are resolved during input
+            // explanation, where they mark the matched path inert.
+            RuleSelection::Ignore => {}
         }
     }
     ferris.affected_crates.sort_by(|left, right| {
@@ -608,6 +676,7 @@ fn explain_inputs(
     ferris: &mut FerrisAffectedReport,
     changed_files: &[ChangedFileInput],
     configured_inputs: &[ConfiguredInput],
+    config: &LitmusConfig,
 ) -> Vec<InputExplanation> {
     let indexed_paths = metadata
         .files
@@ -622,6 +691,16 @@ fn explain_inputs(
             .filter(|input| input.path == *path)
             .collect::<Vec<_>>();
         if !configured.is_empty() {
+            if configured
+                .iter()
+                .all(|input| input.selection == RuleSelection::Ignore)
+            {
+                if let Some(reason) = inert_input_reason(path, metadata, config, configured_inputs)
+                {
+                    explanations.push(inert_explanation(path, &reason));
+                }
+                continue;
+            }
             let configured_package_names = configured
                 .iter()
                 .flat_map(|input| input.packages.iter().cloned())
@@ -770,6 +849,11 @@ fn explain_inputs(
             continue;
         }
 
+        if let Some(reason) = inert_input_reason(path, metadata, config, configured_inputs) {
+            explanations.push(inert_explanation(path, &reason));
+            continue;
+        }
+
         if let Some(package) = package_for_path(metadata, path) {
             insert_package_closure(metadata, ferris, &package.id);
             let (kind, reason) = if path.ends_with(".rs") {
@@ -821,11 +905,76 @@ fn explain_inputs(
     explanations
 }
 
+/// An inert path is a known non-input: it is reported so operators can see why
+/// it selected nothing, but it contributes no packages or workspaces.
+fn inert_explanation(path: &str, reason: &str) -> InputExplanation {
+    InputExplanation {
+        path: path.to_string(),
+        kind: InputKind::Inert,
+        reason: reason.to_string(),
+        packages: Vec::new(),
+        direct_packages: Vec::new(),
+        dependency_chains: Vec::new(),
+        cargo_changes: Vec::new(),
+        workspaces: Vec::new(),
+        failed_wide: false,
+    }
+}
+
 fn looks_generated_input(path: &str) -> bool {
     path == "target"
         || path.starts_with("target/")
         || path.contains("/target/")
         || path.contains("/out/")
+}
+
+/// The shared half of input classification, used both to filter the
+/// ferris-wheel request and to explain inputs. An inert path is one that no
+/// build or test can consume:
+///
+/// - a configured rule always wins, and a non-ignore rule makes the path a real
+///   input,
+/// - Cargo inputs are never inert,
+/// - indexed and embedded sources (`include!`, `include_str!`,
+///   `include_bytes!`, `#[path]`) keep their mapped packages,
+/// - files beneath a package root stay conservative: package code can read them
+///   through paths litmus cannot index (`CARGO_MANIFEST_DIR`, computed paths),
+///   so the package closure remains the answer.
+fn inert_input_reason(
+    path: &str,
+    metadata: &IndexMetadata,
+    config: &LitmusConfig,
+    configured_inputs: &[ConfiguredInput],
+) -> Option<String> {
+    let configured = configured_inputs
+        .iter()
+        .filter(|input| input.path == path)
+        .collect::<Vec<_>>();
+    if !configured.is_empty() {
+        return configured
+            .iter()
+            .all(|input| input.selection == RuleSelection::Ignore)
+            .then(|| "matched a .cargo-litmus.toml ignore rule".to_string());
+    }
+    if cargo_input_kind(path).is_some() {
+        return None;
+    }
+    if is_indexed_or_embedded_source(metadata, path) || package_for_path(metadata, path).is_some() {
+        return None;
+    }
+    config
+        .default_inert_paths
+        .then(|| crate::inert::classify(path))
+        .flatten()
+        .map(str::to_string)
+}
+
+fn is_indexed_or_embedded_source(metadata: &IndexMetadata, path: &str) -> bool {
+    metadata.files.iter().any(|file| file.path == path)
+        || metadata
+            .source_dependencies
+            .iter()
+            .any(|dependency| dependency.target_path == path)
 }
 
 fn cargo_input_kind(path: &str) -> Option<(InputKind, &'static str)> {
@@ -1119,6 +1268,22 @@ fn workspace_uncertainty(
     Some(unknown_files_by_workspace)
 }
 
+/// Every workspace the index knows about, whether or not ferris-wheel reported
+/// it. Workspace-level inputs (lockfiles, workspace manifests, workspace data
+/// directories) belong to a workspace without belonging to any package.
+fn indexed_workspaces(metadata: &IndexMetadata) -> Vec<AffectedWorkspace> {
+    metadata
+        .packages
+        .iter()
+        .map(|package| AffectedWorkspace {
+            name: package.workspace.clone(),
+            path: package.workspace_path.clone(),
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
 fn workspace_for_path<'a>(
     affected_workspaces: &'a [AffectedWorkspace],
     root: &std::path::Path,
@@ -1379,6 +1544,177 @@ impl TestSelection {
     }
 }
 
+fn exclude_test_only_dependents(
+    metadata: &IndexMetadata,
+    ferris: &FerrisAffectedReport,
+    diff: &DiffResult,
+) -> FerrisAffectedReport {
+    // Test targets are not linked into the library that dependents consume, so
+    // a package whose only changes are test sources cannot affect its
+    // dependents. In a change that mixes production and test-only sources,
+    // drop the dependents that only test-only packages reach; production
+    // changes keep their full reverse closure.
+    let production_package_ids = changed_production_package_ids(metadata, diff);
+    if production_package_ids.is_empty() {
+        return ferris.clone();
+    }
+
+    let mut propagating_package_ids = production_package_ids.clone();
+    let mut test_only_package_ids = BTreeSet::new();
+    for file in diff
+        .changed_files
+        .iter()
+        .filter(|file| !diff.unknown_files.contains(&file.path))
+        .filter(|file| !diff.inert_files.contains(&file.path))
+    {
+        let Some(package) = package_for_path(metadata, &file.path) else {
+            continue;
+        };
+        if propagating_package_ids.contains(&package.id) {
+            continue;
+        }
+        if is_included_source(metadata, &file.path) {
+            // Included sources change the library that dependents consume.
+            propagating_package_ids.insert(package.id.clone());
+            continue;
+        }
+        test_only_package_ids.insert(package.id.clone());
+    }
+    test_only_package_ids.retain(|package_id| !propagating_package_ids.contains(package_id));
+    if test_only_package_ids.is_empty() {
+        return ferris.clone();
+    }
+
+    let mut keep = propagating_package_ids.clone();
+    for package_id in &propagating_package_ids {
+        keep.extend(reverse_package_closure(metadata, package_id));
+    }
+    let mut dropped = BTreeSet::new();
+    for package_id in &test_only_package_ids {
+        dropped.extend(reverse_package_closure(metadata, package_id));
+    }
+    dropped.retain(|package_id| {
+        !keep.contains(package_id) && !test_only_package_ids.contains(package_id)
+    });
+    if dropped.is_empty() {
+        return ferris.clone();
+    }
+
+    let packages_by_id = package_by_id(metadata);
+    let dropped_names = dropped
+        .iter()
+        .filter_map(|package_id| {
+            packages_by_id
+                .get(package_id)
+                .map(|package| (package.workspace.clone(), package.name.clone()))
+        })
+        .collect::<BTreeSet<_>>();
+    let dropped_leaf_names = dropped_names
+        .iter()
+        .map(|(_, name)| name.clone())
+        .collect::<BTreeSet<_>>();
+
+    let mut filtered = ferris.clone();
+    filtered
+        .affected_crates
+        .retain(|krate| !dropped_names.contains(&(krate.workspace.clone(), krate.name.clone())));
+    filtered
+        .directly_affected_crates
+        .retain(|name| !dropped_leaf_names.contains(name));
+    filtered
+}
+
+/// Build scripts and manifest edits that touch features, dependencies, targets,
+/// profiles, or workspace inheritance change the artifact dependents compile
+/// against, so narrowing those changes to the owning package is unsafe. Edits
+/// confined to inert metadata stay package-local.
+fn package_build_inputs_propagate(
+    metadata: &IndexMetadata,
+    changed_files: &[ChangedFileInput],
+) -> bool {
+    let root = Path::new(&metadata.repo_root_hint);
+    changed_files.iter().any(|file| {
+        let Some((kind, _)) = cargo_input_kind(&file.path) else {
+            return false;
+        };
+        match kind {
+            InputKind::BuildScript => true,
+            InputKind::CargoManifest => !manifest_edit_is_inert(
+                fs::read_to_string(root.join(&file.path)).ok().as_deref(),
+                &file.ranges,
+            ),
+            _ => false,
+        }
+    })
+}
+
+/// Manifest keys that cannot change what dependents compile. Unrecognized
+/// tables and keys count as semantic, so unknown edits widen instead of
+/// narrowing.
+const INERT_MANIFEST_KEYS: &[&str] = &[
+    "authors",
+    "categories",
+    "description",
+    "documentation",
+    "homepage",
+    "keywords",
+    "license",
+    "license-file",
+    "publish",
+    "readme",
+    "repository",
+    "rust-version",
+];
+
+fn manifest_edit_is_inert(contents: Option<&str>, ranges: &[ChangedLineRange]) -> bool {
+    let (Some(contents), false) = (contents, ranges.is_empty()) else {
+        return false;
+    };
+    let mut table = String::new();
+    for (offset, line) in contents.lines().enumerate() {
+        let line_number = offset + 1;
+        let changed = ranges
+            .iter()
+            .any(|range| range.start_line <= line_number && line_number <= range.end_line);
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            table = trimmed.trim_matches(['[', ']']).trim().to_string();
+            if changed && table != "package" && !table.starts_with("package.metadata") {
+                return false;
+            }
+            continue;
+        }
+        if !changed {
+            continue;
+        }
+        if table.starts_with("package.metadata") {
+            continue;
+        }
+        if table != "package" {
+            return false;
+        }
+        let key = trimmed.split('=').next().unwrap_or_default().trim();
+        if !INERT_MANIFEST_KEYS.contains(&key) {
+            return false;
+        }
+    }
+    true
+}
+
+/// A changed file that other indexed sources include (`include!`, `#[path]`)
+/// changes the library those sources compile into, so narrowing based on the
+/// file's own target is unsafe.
+fn is_included_source(metadata: &IndexMetadata, path: &str) -> bool {
+    metadata
+        .source_dependencies
+        .iter()
+        .any(|dependency| dependency.target_path == path)
+}
+
+fn any_included_source(metadata: &IndexMetadata, paths: &[&str]) -> bool {
+    paths.iter().any(|path| is_included_source(metadata, path))
+}
+
 fn select_test_crates(
     metadata: &IndexMetadata,
     ferris: &FerrisAffectedReport,
@@ -1408,6 +1744,7 @@ fn select_test_crates_with_configured_inputs(
         .changed_files
         .iter()
         .filter(|file| !diff.unknown_files.contains(&file.path))
+        .filter(|file| !diff.inert_files.contains(&file.path))
         .map(|file| file.path.as_str())
         .collect::<Vec<_>>();
     let known_changed_path_strings = known_changed_paths
@@ -1468,9 +1805,11 @@ fn select_test_crates_with_configured_inputs(
         );
     }
 
+    let included_source_changes = any_included_source(metadata, &known_changed_paths);
     let test_target_commands = test_target_commands(metadata, changed_file_inputs);
     if !test_target_commands.is_empty()
         && all_known_changes_are_test_sources(metadata, changed_file_inputs)
+        && !included_source_changes
     {
         return command_test_selection(
             metadata,
@@ -1485,6 +1824,7 @@ fn select_test_crates_with_configured_inputs(
     if !changed_packages.is_empty()
         && changed_packages == test_source_packages
         && changed_production_packages.is_empty()
+        && !included_source_changes
     {
         return package_local_test_selection(
             metadata,
@@ -1496,7 +1836,10 @@ fn select_test_crates_with_configured_inputs(
         );
     }
 
-    if !changed_packages.is_empty() && changed_packages == package_metadata_or_build_packages {
+    if !changed_packages.is_empty()
+        && changed_packages == package_metadata_or_build_packages
+        && !package_build_inputs_propagate(metadata, changed_file_inputs)
+    {
         return package_local_test_selection(
             metadata,
             ferris,
@@ -1920,10 +2263,13 @@ fn affected_workspaces_with_extra(
     workspaces: &[AffectedWorkspace],
     extra: Vec<AffectedWorkspace>,
 ) -> Vec<AffectedWorkspace> {
+    // Workspace identity is its name: ferris-wheel reports absolute paths
+    // while the index reports workspace-relative ones, so path equality cannot
+    // be used to merge the two sources.
     let mut seen = BTreeSet::new();
     let mut merged = Vec::new();
     for workspace in workspaces.iter().chain(extra.iter()) {
-        if seen.insert((workspace.name.clone(), workspace.path.clone())) {
+        if seen.insert(workspace.name.clone()) {
             merged.push(workspace.clone());
         }
     }
@@ -1987,6 +2333,7 @@ fn changed_production_package_ids(metadata: &IndexMetadata, diff: &DiffResult) -
     diff.changed_files
         .iter()
         .filter(|file| !diff.unknown_files.contains(&file.path))
+        .filter(|file| !diff.inert_files.contains(&file.path))
         .filter_map(|file| {
             let package = package_for_path(metadata, &file.path)?;
             if is_test_source_path(metadata, &file.path)
@@ -2447,16 +2794,21 @@ fn is_package_src_path(package: &PackageNode, path: &str) -> bool {
         || path.starts_with(&format!("{}/src/", package.root_path))
 }
 
+/// Sources of targets that are not linked into the library other packages
+/// consume: integration tests, benches, and examples. Changes there cannot
+/// change a dependent's compiled artifact.
 fn is_test_source_path(metadata: &IndexMetadata, path: &str) -> bool {
-    metadata
-        .targets
-        .iter()
-        .any(|target| target.is_test() && target.src_path == path)
-        || package_for_path(metadata, path).is_some_and(|package| {
-            path == format!("{}/tests.rs", package.root_path)
-                || path.starts_with(&format!("{}/tests/", package.root_path))
-                || path.contains(&format!("{}/tests/", package.root_path))
-        })
+    metadata.targets.iter().any(|target| {
+        target.src_path == path
+            && target
+                .kind
+                .iter()
+                .any(|kind| matches!(kind.as_str(), "test" | "bench" | "example"))
+    }) || package_for_path(metadata, path).is_some_and(|package| {
+        path == format!("{}/tests.rs", package.root_path)
+            || path.starts_with(&format!("{}/tests/", package.root_path))
+            || path.contains(&format!("{}/tests/", package.root_path))
+    })
 }
 
 fn test_target_for_path<'a>(
@@ -2493,6 +2845,7 @@ fn fail_wide(
             changed_files: Vec::new(),
             changed_items: Vec::new(),
             unknown_files: selected_files,
+            inert_files: BTreeSet::new(),
         },
     };
     fail_wide_with_diff(
@@ -2523,6 +2876,9 @@ pub struct DiffResult {
     changed_files: Vec<ChangedFile>,
     changed_items: Vec<ChangedItem>,
     unknown_files: Vec<String>,
+    /// Paths classified as unable to affect a build or test. They stay in
+    /// `changed_files` for reporting but never influence selection.
+    inert_files: BTreeSet<String>,
 }
 
 pub fn diff_current_index(current: &IndexMetadata, changed_paths: &[String]) -> DiffResult {
@@ -2563,6 +2919,7 @@ pub fn diff_current_index(current: &IndexMetadata, changed_paths: &[String]) -> 
         changed_files,
         changed_items: Vec::new(),
         unknown_files,
+        inert_files: BTreeSet::new(),
     }
 }
 
@@ -2616,6 +2973,7 @@ pub fn diff_indexes(
         changed_files,
         changed_items,
         unknown_files,
+        inert_files: BTreeSet::new(),
     }
 }
 
@@ -3140,7 +3498,7 @@ mod tests {
     }
 
     #[test]
-    fn build_script_change_selects_owning_package_tests() {
+    fn build_script_change_keeps_dependency_selection() {
         let metadata = package_metadata("api-lib/build.rs");
         let diff = diff_current_index(&metadata, &["api-lib/build.rs".to_string()]);
         let selection = select_test_crates(
@@ -3148,13 +3506,29 @@ mod tests {
             &ferris_report_for_api_lib_test(),
             &diff,
             &BTreeMap::<String, Vec<String>>::new(),
-            &[],
+            &[ChangedFileInput::path_only("api-lib/build.rs")],
         );
 
         assert!(diff.unknown_files.is_empty());
-        assert_eq!(selection.reason, REASON_TEST_PACKAGE_METADATA);
-        assert_eq!(selection.affected_test_crates.len(), 1);
-        assert_eq!(selection.affected_test_crates[0].name, "api-lib");
+        assert_eq!(selection.reason, REASON_TEST_FERRIS_DAG);
+        assert_eq!(selection.affected_test_crates.len(), 2);
+    }
+
+    #[test]
+    fn manifest_edits_are_inert_only_for_package_metadata() {
+        let manifest = "[package]\nname = \"api\"\nversion = \"0.1.0\"\nedition = \
+                        \"2021\"\ndescription = \"api crate\"\n\n[dependencies]\nhelper = { path \
+                        = \"../helper\" }\n";
+        let range = |start_line: usize, end_line: usize| ChangedLineRange {
+            start_line,
+            end_line,
+        };
+
+        assert!(manifest_edit_is_inert(Some(manifest), &[range(5, 5)]));
+        assert!(!manifest_edit_is_inert(Some(manifest), &[range(7, 8)]));
+        assert!(!manifest_edit_is_inert(Some(manifest), &[range(3, 3)]));
+        assert!(!manifest_edit_is_inert(Some(manifest), &[]));
+        assert!(!manifest_edit_is_inert(None, &[range(5, 5)]));
     }
 
     #[test]
@@ -3739,6 +4113,30 @@ mod tests {
 
         assert_eq!(ferris.affected_workspaces.len(), 1);
         assert_eq!(ferris.directly_affected_workspaces.len(), 1);
+    }
+
+    #[test]
+    fn workspace_merge_deduplicates_absolute_and_relative_paths_by_name() {
+        let ferris_workspaces = vec![AffectedWorkspace {
+            name: "nodes".to_string(),
+            path: "/repo/nodes".to_string(),
+        }];
+        let indexed_workspaces = vec![
+            AffectedWorkspace {
+                name: "nodes".to_string(),
+                path: "nodes".to_string(),
+            },
+            AffectedWorkspace {
+                name: "sdk".to_string(),
+                path: "sdk".to_string(),
+            },
+        ];
+
+        let merged = affected_workspaces_with_extra(&ferris_workspaces, indexed_workspaces);
+
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].path, "/repo/nodes");
+        assert_eq!(merged[1].name, "sdk");
     }
 
     #[test]

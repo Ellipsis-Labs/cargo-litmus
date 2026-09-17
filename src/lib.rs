@@ -8,6 +8,7 @@ pub mod error;
 pub mod explain;
 pub mod ferris;
 pub mod indexer;
+pub mod inert;
 pub mod model;
 pub mod nextest;
 pub mod parser;

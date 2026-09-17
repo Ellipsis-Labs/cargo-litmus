@@ -8,13 +8,32 @@ use crate::error::{LitmusError, Result};
 
 pub const CONFIG_FILE_NAME: &str = ".cargo-litmus.toml";
 
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct LitmusConfig {
     #[serde(default)]
     pub rules: Vec<InputRule>,
     #[serde(default, rename = "build-script-inputs")]
     pub build_script_inputs: Vec<BuildScriptInput>,
+    /// Classify built-in inert path classes (documentation, media, legal
+    /// files, CI, agent, and editor metadata). Disable to make every unmapped
+    /// file conservative again.
+    #[serde(default = "default_inert_paths", rename = "default-inert-paths")]
+    pub default_inert_paths: bool,
+}
+
+fn default_inert_paths() -> bool {
+    true
+}
+
+impl Default for LitmusConfig {
+    fn default() -> Self {
+        Self {
+            rules: Vec::new(),
+            build_script_inputs: Vec::new(),
+            default_inert_paths: default_inert_paths(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -40,6 +59,10 @@ pub struct InputRule {
 pub enum RuleSelection {
     Workspace,
     Packages,
+    /// The matched paths cannot affect a build or test, so they select
+    /// nothing. Use for repository-specific generated trees, vendored
+    /// tooling, or documentation outside the built-in inert classes.
+    Ignore,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -147,6 +170,15 @@ impl LitmusConfig {
                         path,
                         index,
                         "package selection requires at least one package",
+                    ));
+                }
+                RuleSelection::Ignore
+                    if !rule.workspaces.is_empty() || !rule.packages.is_empty() =>
+                {
+                    return Err(config_error(
+                        path,
+                        index,
+                        "ignore selection cannot name workspaces or packages",
                     ));
                 }
                 _ => {}
@@ -303,5 +335,57 @@ packages = ["generated-api"]
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].source, ConfiguredInputSource::BuildScriptInput);
         assert_eq!(matches[0].packages, vec!["generated-api"]);
+    }
+
+    #[test]
+    fn matches_ignore_rules_without_a_selection() {
+        let config = LitmusConfig::parse(
+            Path::new(".cargo-litmus.toml"),
+            r#"
+[[rules]]
+paths = ["ts/**"]
+selection = "ignore"
+"#,
+        )
+        .unwrap();
+
+        let matches = config.matches(["ts/app.ts".to_string()]).unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].selection, RuleSelection::Ignore);
+        assert!(matches[0].packages.is_empty());
+        assert!(matches[0].workspaces.is_empty());
+    }
+
+    #[test]
+    fn rejects_ignore_rules_that_name_a_selection() {
+        let error = LitmusConfig::parse(
+            Path::new(".cargo-litmus.toml"),
+            r#"
+[[rules]]
+paths = ["ts/**"]
+packages = ["web"]
+selection = "ignore"
+"#,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("ignore selection cannot name workspaces or packages")
+        );
+    }
+
+    #[test]
+    fn defaults_to_built_in_inert_paths() {
+        let config = LitmusConfig::parse(Path::new(".cargo-litmus.toml"), "").unwrap();
+        assert!(config.default_inert_paths);
+        assert!(LitmusConfig::default().default_inert_paths);
+
+        let disabled = LitmusConfig::parse(
+            Path::new(".cargo-litmus.toml"),
+            "default-inert-paths = false\n",
+        )
+        .unwrap();
+        assert!(!disabled.default_inert_paths);
     }
 }

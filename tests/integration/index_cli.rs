@@ -641,7 +641,10 @@ fn arbitrary_package_root_input_selects_package_without_uncertainty() {
             "sandbox/cargo-litmus/Cargo.toml",
             "[package]\nname = \"cargo-litmus\"\n",
         ),
-        ("sandbox/cargo-litmus/README.md", "litmus notes\n"),
+        (
+            "sandbox/cargo-litmus/fixtures/input.json",
+            "{\"version\": 1}\n",
+        ),
     ]);
 
     let report = compute_affected(
@@ -649,7 +652,7 @@ fn arbitrary_package_root_input_selects_package_without_uncertainty() {
             root: repo.path().to_path_buf(),
             files: vec![
                 "services/src/lib.rs".to_string(),
-                "sandbox/cargo-litmus/README.md".to_string(),
+                "sandbox/cargo-litmus/fixtures/input.json".to_string(),
             ],
             changed_files: Vec::new(),
             base_cache: None,
@@ -663,7 +666,7 @@ fn arbitrary_package_root_input_selects_package_without_uncertainty() {
     assert!(report.unknown_files.is_empty());
     assert_eq!(report.nextest_validation, NextestValidation::Skipped);
     assert!(report.input_explanations.iter().any(|input| {
-        input.path == "sandbox/cargo-litmus/README.md"
+        input.path == "sandbox/cargo-litmus/fixtures/input.json"
             && input.kind == InputKind::PackageInput
             && !input.failed_wide
     }));
