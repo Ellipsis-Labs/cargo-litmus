@@ -58,21 +58,19 @@ pub struct CommandFerrisRunner;
 impl FerrisRunner for CommandFerrisRunner {
     fn ripples(&self, root: &Path, files: &[String]) -> Result<FerrisAffectedReport> {
         let mut args = vec![
-            "ferris-wheel".to_string(),
             "ripples".to_string(),
             "--format".to_string(),
             "json".to_string(),
         ];
         args.extend(files.iter().cloned());
-        let stdout = run_cargo(root, &args)?;
+        let stdout = run_ferris(root, &args)?;
         parse_ripples_output(&stdout)
     }
 
     fn lineup(&self, root: &Path) -> Result<FerrisAffectedReport> {
-        let stdout = run_cargo(
+        let stdout = run_ferris(
             root,
             &[
-                "ferris-wheel".to_string(),
                 "lineup".to_string(),
                 "--format".to_string(),
                 "json".to_string(),
@@ -81,26 +79,37 @@ impl FerrisRunner for CommandFerrisRunner {
         let payload = extract_json_block(&stdout)?;
         let report: LineupReport =
             serde_json::from_str(payload).map_err(|source| LitmusError::ParseExternalJson {
-                source_name: "cargo ferris-wheel lineup".to_string(),
+                source_name: "cargo-ferris-wheel lineup".to_string(),
                 message: source.to_string(),
             })?;
         Ok(lineup_to_fail_wide(report))
     }
 }
 
-fn run_cargo(root: &Path, args: &[String]) -> Result<String> {
-    let output = Command::new("cargo")
+/// Runs `cargo-ferris-wheel` directly.
+///
+/// Direct invocation works from monorepo roots without a root `Cargo.toml`,
+/// including environments where `cargo` is wrapped by a build cache such as
+/// mbx, where Cargo's external-subcommand dispatch fails before workspace
+/// discovery starts. Recent `cargo-ferris-wheel` releases support it; Litmus
+/// requires one.
+fn run_ferris(root: &Path, args: &[String]) -> Result<String> {
+    run_program(Path::new("cargo-ferris-wheel"), root, args)
+}
+
+fn run_program(program: &Path, root: &Path, args: &[String]) -> Result<String> {
+    let output = Command::new(program)
         .args(args)
         .current_dir(root)
         .output()
         .map_err(|source| LitmusError::CommandIo {
-            command: format!("cargo {}", args.join(" ")),
+            command: command_label(program, args),
             source,
         })?;
 
     if !output.status.success() {
         return Err(LitmusError::CommandFailed {
-            command: format!("cargo {}", args.join(" ")),
+            command: command_label(program, args),
             code: output.status.code().unwrap_or(-1),
             stderr: String::from_utf8_lossy(&output.stderr).to_string(),
         });
@@ -109,10 +118,19 @@ fn run_cargo(root: &Path, args: &[String]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+fn command_label(program: &Path, args: &[String]) -> String {
+    let mut label = program.display().to_string();
+    for arg in args {
+        label.push(' ');
+        label.push_str(arg);
+    }
+    label
+}
+
 pub fn parse_ripples_output(raw: &str) -> Result<FerrisAffectedReport> {
     let payload = extract_json_block(raw)?;
     serde_json::from_str(payload).map_err(|source| LitmusError::ParseExternalJson {
-        source_name: "cargo ferris-wheel ripples".to_string(),
+        source_name: "cargo-ferris-wheel ripples".to_string(),
         message: source.to_string(),
     })
 }

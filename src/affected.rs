@@ -420,7 +420,7 @@ fn compute_affected_internal(
                 runner,
                 diff,
                 Some(current_summary.clone()),
-                "cargo ferris-wheel ripples failed",
+                "cargo-ferris-wheel ripples failed",
                 cache_status,
                 base_reference,
             );
@@ -482,6 +482,7 @@ fn compute_affected_internal(
         REASON_BUILD_FROM_FERRIS_WITH_UNCERTAINTY
     };
     let mut test_selection = if configured_inputs.is_empty() {
+        let ferris = exclude_test_only_dependents(current_metadata, &ferris, &diff);
         select_test_crates(
             current_metadata,
             &ferris,
@@ -1379,6 +1380,176 @@ impl TestSelection {
     }
 }
 
+fn exclude_test_only_dependents(
+    metadata: &IndexMetadata,
+    ferris: &FerrisAffectedReport,
+    diff: &DiffResult,
+) -> FerrisAffectedReport {
+    // Test targets are not linked into the library that dependents consume, so
+    // a package whose only changes are test sources cannot affect its
+    // dependents. In a change that mixes production and test-only sources,
+    // drop the dependents that only test-only packages reach; production
+    // changes keep their full reverse closure.
+    let production_package_ids = changed_production_package_ids(metadata, diff);
+    if production_package_ids.is_empty() {
+        return ferris.clone();
+    }
+
+    let mut propagating_package_ids = production_package_ids.clone();
+    let mut test_only_package_ids = BTreeSet::new();
+    for file in diff
+        .changed_files
+        .iter()
+        .filter(|file| !diff.unknown_files.contains(&file.path))
+    {
+        let Some(package) = package_for_path(metadata, &file.path) else {
+            continue;
+        };
+        if propagating_package_ids.contains(&package.id) {
+            continue;
+        }
+        if is_included_source(metadata, &file.path) {
+            // Included sources change the library that dependents consume.
+            propagating_package_ids.insert(package.id.clone());
+            continue;
+        }
+        test_only_package_ids.insert(package.id.clone());
+    }
+    test_only_package_ids.retain(|package_id| !propagating_package_ids.contains(package_id));
+    if test_only_package_ids.is_empty() {
+        return ferris.clone();
+    }
+
+    let mut keep = propagating_package_ids.clone();
+    for package_id in &propagating_package_ids {
+        keep.extend(reverse_package_closure(metadata, package_id));
+    }
+    let mut dropped = BTreeSet::new();
+    for package_id in &test_only_package_ids {
+        dropped.extend(reverse_package_closure(metadata, package_id));
+    }
+    dropped.retain(|package_id| {
+        !keep.contains(package_id) && !test_only_package_ids.contains(package_id)
+    });
+    if dropped.is_empty() {
+        return ferris.clone();
+    }
+
+    let packages_by_id = package_by_id(metadata);
+    let dropped_names = dropped
+        .iter()
+        .filter_map(|package_id| {
+            packages_by_id
+                .get(package_id)
+                .map(|package| (package.workspace.clone(), package.name.clone()))
+        })
+        .collect::<BTreeSet<_>>();
+    let dropped_leaf_names = dropped_names
+        .iter()
+        .map(|(_, name)| name.clone())
+        .collect::<BTreeSet<_>>();
+
+    let mut filtered = ferris.clone();
+    filtered
+        .affected_crates
+        .retain(|krate| !dropped_names.contains(&(krate.workspace.clone(), krate.name.clone())));
+    filtered
+        .directly_affected_crates
+        .retain(|name| !dropped_leaf_names.contains(name));
+    filtered
+}
+
+/// Build scripts and manifest edits that touch features, dependencies, targets,
+/// profiles, or workspace inheritance change the artifact dependents compile
+/// against, so narrowing those changes to the owning package is unsafe. Edits
+/// confined to inert metadata stay package-local.
+fn package_build_inputs_propagate(
+    metadata: &IndexMetadata,
+    changed_files: &[ChangedFileInput],
+) -> bool {
+    let root = Path::new(&metadata.repo_root_hint);
+    changed_files.iter().any(|file| {
+        let Some((kind, _)) = cargo_input_kind(&file.path) else {
+            return false;
+        };
+        match kind {
+            InputKind::BuildScript => true,
+            InputKind::CargoManifest => !manifest_edit_is_inert(
+                fs::read_to_string(root.join(&file.path)).ok().as_deref(),
+                &file.ranges,
+            ),
+            _ => false,
+        }
+    })
+}
+
+/// Manifest keys that cannot change what dependents compile. Unrecognized
+/// tables and keys count as semantic, so unknown edits widen instead of
+/// narrowing.
+const INERT_MANIFEST_KEYS: &[&str] = &[
+    "authors",
+    "categories",
+    "description",
+    "documentation",
+    "homepage",
+    "keywords",
+    "license",
+    "license-file",
+    "publish",
+    "readme",
+    "repository",
+    "rust-version",
+];
+
+fn manifest_edit_is_inert(contents: Option<&str>, ranges: &[ChangedLineRange]) -> bool {
+    let (Some(contents), false) = (contents, ranges.is_empty()) else {
+        return false;
+    };
+    let mut table = String::new();
+    for (offset, line) in contents.lines().enumerate() {
+        let line_number = offset + 1;
+        let changed = ranges
+            .iter()
+            .any(|range| range.start_line <= line_number && line_number <= range.end_line);
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            table = trimmed.trim_matches(['[', ']']).trim().to_string();
+            if changed && table != "package" && !table.starts_with("package.metadata") {
+                return false;
+            }
+            continue;
+        }
+        if !changed {
+            continue;
+        }
+        if table.starts_with("package.metadata") {
+            continue;
+        }
+        if table != "package" {
+            return false;
+        }
+        let key = trimmed.split('=').next().unwrap_or_default().trim();
+        if !INERT_MANIFEST_KEYS.contains(&key) {
+            return false;
+        }
+    }
+    true
+}
+
+/// A changed file that other indexed sources include (`include!`, `#[path]`)
+/// changes the library those sources compile into, so narrowing based on the
+/// file's own target is unsafe.
+fn is_included_source(metadata: &IndexMetadata, path: &str) -> bool {
+    metadata
+        .source_dependencies
+        .iter()
+        .any(|dependency| dependency.target_path == path)
+}
+
+fn any_included_source(metadata: &IndexMetadata, paths: &[&str]) -> bool {
+    paths.iter().any(|path| is_included_source(metadata, path))
+}
+
 fn select_test_crates(
     metadata: &IndexMetadata,
     ferris: &FerrisAffectedReport,
@@ -1468,9 +1639,11 @@ fn select_test_crates_with_configured_inputs(
         );
     }
 
+    let included_source_changes = any_included_source(metadata, &known_changed_paths);
     let test_target_commands = test_target_commands(metadata, changed_file_inputs);
     if !test_target_commands.is_empty()
         && all_known_changes_are_test_sources(metadata, changed_file_inputs)
+        && !included_source_changes
     {
         return command_test_selection(
             metadata,
@@ -1485,6 +1658,7 @@ fn select_test_crates_with_configured_inputs(
     if !changed_packages.is_empty()
         && changed_packages == test_source_packages
         && changed_production_packages.is_empty()
+        && !included_source_changes
     {
         return package_local_test_selection(
             metadata,
@@ -1496,7 +1670,10 @@ fn select_test_crates_with_configured_inputs(
         );
     }
 
-    if !changed_packages.is_empty() && changed_packages == package_metadata_or_build_packages {
+    if !changed_packages.is_empty()
+        && changed_packages == package_metadata_or_build_packages
+        && !package_build_inputs_propagate(metadata, changed_file_inputs)
+    {
         return package_local_test_selection(
             metadata,
             ferris,
@@ -2447,16 +2624,21 @@ fn is_package_src_path(package: &PackageNode, path: &str) -> bool {
         || path.starts_with(&format!("{}/src/", package.root_path))
 }
 
+/// Sources of targets that are not linked into the library other packages
+/// consume: integration tests, benches, and examples. Changes there cannot
+/// change a dependent's compiled artifact.
 fn is_test_source_path(metadata: &IndexMetadata, path: &str) -> bool {
-    metadata
-        .targets
-        .iter()
-        .any(|target| target.is_test() && target.src_path == path)
-        || package_for_path(metadata, path).is_some_and(|package| {
-            path == format!("{}/tests.rs", package.root_path)
-                || path.starts_with(&format!("{}/tests/", package.root_path))
-                || path.contains(&format!("{}/tests/", package.root_path))
-        })
+    metadata.targets.iter().any(|target| {
+        target.src_path == path
+            && target
+                .kind
+                .iter()
+                .any(|kind| matches!(kind.as_str(), "test" | "bench" | "example"))
+    }) || package_for_path(metadata, path).is_some_and(|package| {
+        path == format!("{}/tests.rs", package.root_path)
+            || path.starts_with(&format!("{}/tests/", package.root_path))
+            || path.contains(&format!("{}/tests/", package.root_path))
+    })
 }
 
 fn test_target_for_path<'a>(
@@ -3140,7 +3322,7 @@ mod tests {
     }
 
     #[test]
-    fn build_script_change_selects_owning_package_tests() {
+    fn build_script_change_keeps_dependency_selection() {
         let metadata = package_metadata("api-lib/build.rs");
         let diff = diff_current_index(&metadata, &["api-lib/build.rs".to_string()]);
         let selection = select_test_crates(
@@ -3148,13 +3330,29 @@ mod tests {
             &ferris_report_for_api_lib_test(),
             &diff,
             &BTreeMap::<String, Vec<String>>::new(),
-            &[],
+            &[ChangedFileInput::path_only("api-lib/build.rs")],
         );
 
         assert!(diff.unknown_files.is_empty());
-        assert_eq!(selection.reason, REASON_TEST_PACKAGE_METADATA);
-        assert_eq!(selection.affected_test_crates.len(), 1);
-        assert_eq!(selection.affected_test_crates[0].name, "api-lib");
+        assert_eq!(selection.reason, REASON_TEST_FERRIS_DAG);
+        assert_eq!(selection.affected_test_crates.len(), 2);
+    }
+
+    #[test]
+    fn manifest_edits_are_inert_only_for_package_metadata() {
+        let manifest = "[package]\nname = \"api\"\nversion = \"0.1.0\"\nedition = \
+                        \"2021\"\ndescription = \"api crate\"\n\n[dependencies]\nhelper = { path \
+                        = \"../helper\" }\n";
+        let range = |start_line: usize, end_line: usize| ChangedLineRange {
+            start_line,
+            end_line,
+        };
+
+        assert!(manifest_edit_is_inert(Some(manifest), &[range(5, 5)]));
+        assert!(!manifest_edit_is_inert(Some(manifest), &[range(7, 8)]));
+        assert!(!manifest_edit_is_inert(Some(manifest), &[range(3, 3)]));
+        assert!(!manifest_edit_is_inert(Some(manifest), &[]));
+        assert!(!manifest_edit_is_inert(None, &[range(5, 5)]));
     }
 
     #[test]

@@ -227,24 +227,33 @@ fn changed_files_from_diff(mut diff: Diff<'_>) -> Result<Vec<ChangedFileInput>> 
     diff.foreach(
         &mut |_delta, _progress| true,
         None,
-        Some(&mut |delta, hunk| {
+        None,
+        Some(&mut |delta, _hunk, line| {
+            // Record the precise lines the change adds. Hunk ranges include
+            // context lines, which would make every edit look like it touched
+            // the whole neighborhood of the change.
+            if line.origin() != '+' {
+                return true;
+            }
             let path = delta.new_file().path().or_else(|| delta.old_file().path());
-            if let Some(path) = path.and_then(Path::to_str) {
-                let start = usize::try_from(hunk.new_start()).unwrap_or(0);
-                let lines = usize::try_from(hunk.new_lines()).unwrap_or(0);
-                if start > 0 && lines > 0 {
-                    by_path
-                        .entry(normalize_path(path))
-                        .or_default()
-                        .push(ChangedLineRange {
-                            start_line: start,
-                            end_line: start + lines - 1,
-                        });
-                }
+            let Some(path) = path.and_then(Path::to_str) else {
+                return true;
+            };
+            let Some(line_number) = line.new_lineno() else {
+                return true;
+            };
+            let line_number = usize::try_from(line_number).unwrap_or(0);
+            if line_number > 0 {
+                by_path
+                    .entry(normalize_path(path))
+                    .or_default()
+                    .push(ChangedLineRange {
+                        start_line: line_number,
+                        end_line: line_number,
+                    });
             }
             true
         }),
-        None,
     )?;
 
     Ok(merge_changed_file_inputs(

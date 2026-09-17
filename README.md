@@ -12,6 +12,8 @@ Conservatively select the Rust tests affected by a Git change.
 
 `cargo-litmus` requires `cargo-ferris-wheel` for affected-package discovery. [`cargo-nextest`](https://nexte.st/) is optional unless you use `--validate-nextest` or execute the generated commands.
 
+Litmus invokes the `cargo-ferris-wheel` binary directly and requires version 1.1.4 or newer. Direct invocation works from monorepo roots without a root `Cargo.toml`, including environments where `cargo` is wrapped by a build cache such as mbx.
+
 ```bash
 # Fastest when cargo-binstall is available.
 cargo binstall cargo-litmus cargo-ferris-wheel cargo-nextest
@@ -129,6 +131,19 @@ cargo +nightly-2025-07-08 fmt --check
 cargo deny check
 cargo audit
 ```
+
+### Scenario tests
+
+`tests/scenarios.rs` covers selection accuracy end to end. Each scenario synthesizes a
+multi-workspace Cargo monorepo in a temporary Git repository, builds a base index,
+commits a change, and runs the real `cargo-litmus affected` binary against it;
+`tests/support/mod.rs` provides the monorepo builders and scripts `cargo-ferris-wheel`
+deterministically, so the suite needs no installed ferris-wheel.
+
+Scenario expectations are two-sided: `required` packages fail the run when they are
+missing (a false negative) and `allowed` packages fail the run when they are exceeded
+(over-selection past the scenario's declared conservative allowance). Add a scenario
+whenever a change class can widen or narrow selection.
 
 ## License
 
