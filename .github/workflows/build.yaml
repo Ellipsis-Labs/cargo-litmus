@@ -27,14 +27,10 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v7
-      - uses: ./.github/actions/rust-cache
+      - uses: jdx/mr-boxington-action@v1
         with:
-          cache-name: check
-      - uses: ./.github/actions/cargo-binstall
-        with:
-          binaries: cargo-hold
-      - run: cargo hold voyage
-      - run: cargo check --locked --all-targets
+          cache-generation: check
+      - run: mbx check --locked --all-targets
 
   test:
     runs-on: ${{ matrix.os }}
@@ -44,14 +40,13 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v7
-      - uses: ./.github/actions/rust-cache
+      - uses: jdx/mr-boxington-action@v1
         with:
-          cache-name: test
+          cache-generation: test
       - uses: ./.github/actions/cargo-binstall
         with:
-          binaries: cargo-nextest cargo-hold
-      - run: cargo hold voyage
-      - run: cargo nextest run --locked --profile ci
+          binaries: cargo-nextest
+      - run: mbx nextest run --locked --profile ci
 
   doctest:
     runs-on: ${{ matrix.os }}
@@ -61,27 +56,19 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v7
-      - uses: ./.github/actions/rust-cache
+      - uses: jdx/mr-boxington-action@v1
         with:
-          cache-name: doctest
-      - uses: ./.github/actions/cargo-binstall
-        with:
-          binaries: cargo-hold
-      - run: cargo hold voyage
-      - run: cargo test --locked --doc
+          cache-generation: doctest
+      - run: mbx test --locked --doc
 
   clippy:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: ./.github/actions/rust-cache
+      - uses: jdx/mr-boxington-action@v1
         with:
-          cache-name: clippy
-      - uses: ./.github/actions/cargo-binstall
-        with:
-          binaries: cargo-hold
-      - run: cargo hold voyage
-      - run: cargo clippy --all-targets -- -D warnings
+          cache-generation: clippy
+      - run: mbx clippy --all-targets -- -D warnings
 
   fmt:
     runs-on: ubuntu-latest
