@@ -338,6 +338,30 @@ packages = ["generated-api"]
     }
 
     #[test]
+    fn matches_supports_brace_alternates_and_common_globs() {
+        let config = LitmusConfig::parse(
+            Path::new(".cargo-litmus.toml"),
+            r#"
+[[rules]]
+paths = ["**/*.{ts,tsx}"]
+selection = "ignore"
+"#,
+        )
+        .unwrap();
+
+        let matches = config
+            .matches([
+                "ts/dashboard/src/app.tsx".to_string(),
+                "web/src/main.ts".to_string(),
+                "src/lib.rs".to_string(),
+                "package.json".to_string(),
+            ])
+            .unwrap();
+        let matched: Vec<&str> = matches.iter().map(|input| input.path.as_str()).collect();
+        assert_eq!(matched, ["ts/dashboard/src/app.tsx", "web/src/main.ts"]);
+    }
+
+    #[test]
     fn matches_ignore_rules_without_a_selection() {
         let config = LitmusConfig::parse(
             Path::new(".cargo-litmus.toml"),

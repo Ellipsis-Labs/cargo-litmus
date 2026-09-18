@@ -104,9 +104,12 @@ The built-in inert classes are:
 | class | examples |
 |---|---|
 | documentation and media | `*.md`, `*.mdx`, `*.rst`, `*.adoc`, `*.png`, `*.svg`, `*.pdf`, `*.woff2` |
+| JavaScript and TypeScript sources | `*.ts`, `*.tsx`, `*.js`, `*.jsx`, `*.mjs`, `*.cjs`, `*.mts`, `*.cts` |
 | legal and community | `LICENSE*`, `COPYING*`, `NOTICE*`, `CHANGELOG*`, `CONTRIBUTING*`, `SECURITY*`, `CODEOWNERS` |
 | CI, agent, and editor metadata | `.github/**`, `.agents/**`, `.claude/**`, `.cursor/**`, `.devcontainer/**`, `.vscode/**`, `.idea/**` |
 | container recipes | `Dockerfile*`, `*.dockerfile`, `.dockerignore`, `docker-compose*.yml` |
+
+JavaScript and TypeScript sources are classified inert because Cargo never compiles, runs, or consumes them; the toolchain that does is outside the index. Repositories whose Rust builds or tests read JavaScript or TypeScript trees map those paths back in with `[[rules]]`; configured rules win over inert classification.
 
 Data and configuration files (`*.toml`, `*.yaml`, `*.json`, `*.sql`, `*.snap`, scripts, templates) are never inert, because a build or test can read them at runtime. Declare them with `.cargo-litmus.toml` rules, or add `selection = "ignore"` rules for repository-specific trees that cannot affect tests:
 
@@ -141,6 +144,10 @@ selection = "ignore"
 paths = ["codegen/**"]
 packages = ["generated-client"]
 ```
+
+Patterns are `globset` globs: `*`, `**`, `?`, character classes (`[abc]`, `[!abc]`), and `{a,b}` alternates (`*.{js,jsx,ts,tsx}`) are supported. Patterns match repository-relative paths.
+
+A path matched by several rules is a real input if any matching rule selects workspaces or packages; it is inert only when *every* matching rule ignores it. A broad `selection = "ignore"` rule therefore cannot shadow a narrower mapping rule, whatever the order in the file.
 
 Rules are strict: unknown fields, invalid globs, and empty or contradictory selections are errors. Inputs that remain unmapped and are not classified inert widen selection rather than being ignored.
 

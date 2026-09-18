@@ -860,6 +860,44 @@ fn ci_metadata_change_does_not_widen_a_rust_change() {
 }
 
 #[test]
+fn javascript_source_change_outside_workspaces_selects_nothing() {
+    let monorepo = Monorepo::new(vec![ws("core").package(pkg("math"))]);
+    check(
+        "javascript_source_change_outside_workspaces_selects_nothing",
+        monorepo,
+        &[create("web/src/main.tsx", "export const app = 1;\n")],
+        &Expect::exact::<&str>(&[]).forbid_global_fail_wide().note(
+            "JavaScript and TypeScript sources are never built or run by Cargo; repos whose \
+             builds read them map them with [[rules]]",
+        ),
+    );
+}
+
+#[test]
+fn javascript_source_change_does_not_widen_a_rust_change() {
+    let monorepo = Monorepo::new(vec![
+        ws("core").package(pkg("math")),
+        ws("sdk")
+            .package(pkg("state").dep_at("math", "../../core/math"))
+            .package(pkg("unrelated")),
+    ]);
+    check(
+        "javascript_source_change_does_not_widen_a_rust_change",
+        monorepo,
+        &[
+            edit("core/math/src/lib.rs", "pub fn math() -> u32 { 2 }\n"),
+            create("web/src/main.ts", "export const app = 1;\n"),
+        ],
+        &Expect::exact(&[target("core/math"), target("sdk/state")])
+            .forbid_global_fail_wide()
+            .note(
+                "a JavaScript or TypeScript tree outside every workspace must not add workspaces \
+                 or packages beyond the Rust change's closure",
+            ),
+    );
+}
+
+#[test]
 fn configured_ignore_rule_marks_repo_specific_paths_inert() {
     let monorepo = Monorepo::new(vec![
         ws("core").package(pkg("math")),
@@ -883,6 +921,56 @@ fn configured_ignore_rule_marks_repo_specific_paths_inert() {
             .note(
                 "an ignore rule, and the configuration file itself, must not widen selection or \
                  disable narrowing",
+            ),
+    );
+}
+
+#[test]
+fn configured_mapping_beats_broad_ignore_rule() {
+    let monorepo = Monorepo::new(vec![
+        ws("core").package(pkg("math")),
+        ws("sdk")
+            .package(pkg("state").dep_at("math", "../../core/math"))
+            .package(pkg("unrelated")),
+    ]);
+    monorepo.write(
+        ".cargo-litmus.toml",
+        "[[rules]]\npaths = [\"ts/**\"]\nselection = \"ignore\"\n\n[[rules]]\npaths = \
+         [\"ts/tests/mocks/**\"]\npackages = [\"math\"]\nselection = \"packages\"\n",
+    );
+    check(
+        "configured_mapping_beats_broad_ignore_rule",
+        monorepo,
+        &[create("ts/tests/mocks/account.json", "{}\n")],
+        &Expect::exact(&[target("core/math"), target("sdk/state")])
+            .forbid_global_fail_wide()
+            .note(
+                "a path matched by both an ignore rule and a packages rule stays a real input; \
+                 the mapping selects the consuming package instead of dropping or widening",
+            ),
+    );
+}
+
+#[test]
+fn javascript_source_under_package_root_stays_conservative() {
+    let monorepo = Monorepo::new(vec![
+        ws("core").package(pkg("math")),
+        ws("sdk")
+            .package(pkg("state").dep_at("math", "../../core/math"))
+            .package(pkg("unrelated")),
+    ]);
+    check(
+        "javascript_source_under_package_root_stays_conservative",
+        monorepo,
+        &[create(
+            "core/math/src/gen/tables.ts",
+            "export const table = [1];\n",
+        )],
+        &Expect::exact(&[target("core/math"), target("sdk/state")])
+            .forbid_global_fail_wide()
+            .note(
+                "inert classification stops at package roots: package code can read sibling files \
+                 through CARGO_MANIFEST_DIR, so the JavaScript class must not swallow them",
             ),
     );
 }
