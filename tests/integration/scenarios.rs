@@ -926,6 +926,56 @@ fn configured_ignore_rule_marks_repo_specific_paths_inert() {
 }
 
 #[test]
+fn configured_mapping_beats_broad_ignore_rule() {
+    let monorepo = Monorepo::new(vec![
+        ws("core").package(pkg("math")),
+        ws("sdk")
+            .package(pkg("state").dep_at("math", "../../core/math"))
+            .package(pkg("unrelated")),
+    ]);
+    monorepo.write(
+        ".cargo-litmus.toml",
+        "[[rules]]\npaths = [\"ts/**\"]\nselection = \"ignore\"\n\n[[rules]]\npaths = \
+         [\"ts/tests/mocks/**\"]\npackages = [\"math\"]\nselection = \"packages\"\n",
+    );
+    check(
+        "configured_mapping_beats_broad_ignore_rule",
+        monorepo,
+        &[create("ts/tests/mocks/account.json", "{}\n")],
+        &Expect::exact(&[target("core/math"), target("sdk/state")])
+            .forbid_global_fail_wide()
+            .note(
+                "a path matched by both an ignore rule and a packages rule stays a real input; \
+                 the mapping selects the consuming package instead of dropping or widening",
+            ),
+    );
+}
+
+#[test]
+fn javascript_source_under_package_root_stays_conservative() {
+    let monorepo = Monorepo::new(vec![
+        ws("core").package(pkg("math")),
+        ws("sdk")
+            .package(pkg("state").dep_at("math", "../../core/math"))
+            .package(pkg("unrelated")),
+    ]);
+    check(
+        "javascript_source_under_package_root_stays_conservative",
+        monorepo,
+        &[create(
+            "core/math/src/gen/tables.ts",
+            "export const table = [1];\n",
+        )],
+        &Expect::exact(&[target("core/math"), target("sdk/state")])
+            .forbid_global_fail_wide()
+            .note(
+                "inert classification stops at package roots: package code can read sibling files \
+                 through CARGO_MANIFEST_DIR, so the JavaScript class must not swallow them",
+            ),
+    );
+}
+
+#[test]
 fn configured_ignore_rule_keeps_module_narrowing() {
     let base_lib = "pub fn adds(left: u32, right: u32) -> u32 {\n    left + \
                     right\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    #[test]\n    \
