@@ -860,6 +860,44 @@ fn ci_metadata_change_does_not_widen_a_rust_change() {
 }
 
 #[test]
+fn javascript_source_change_outside_workspaces_selects_nothing() {
+    let monorepo = Monorepo::new(vec![ws("core").package(pkg("math"))]);
+    check(
+        "javascript_source_change_outside_workspaces_selects_nothing",
+        monorepo,
+        &[create("web/src/main.tsx", "export const app = 1;\n")],
+        &Expect::exact::<&str>(&[]).forbid_global_fail_wide().note(
+            "JavaScript and TypeScript sources are never built or run by Cargo; repos whose \
+             builds read them map them with [[rules]]",
+        ),
+    );
+}
+
+#[test]
+fn javascript_source_change_does_not_widen_a_rust_change() {
+    let monorepo = Monorepo::new(vec![
+        ws("core").package(pkg("math")),
+        ws("sdk")
+            .package(pkg("state").dep_at("math", "../../core/math"))
+            .package(pkg("unrelated")),
+    ]);
+    check(
+        "javascript_source_change_does_not_widen_a_rust_change",
+        monorepo,
+        &[
+            edit("core/math/src/lib.rs", "pub fn math() -> u32 { 2 }\n"),
+            create("web/src/main.ts", "export const app = 1;\n"),
+        ],
+        &Expect::exact(&[target("core/math"), target("sdk/state")])
+            .forbid_global_fail_wide()
+            .note(
+                "a JavaScript or TypeScript tree outside every workspace must not add workspaces \
+                 or packages beyond the Rust change's closure",
+            ),
+    );
+}
+
+#[test]
 fn configured_ignore_rule_marks_repo_specific_paths_inert() {
     let monorepo = Monorepo::new(vec![
         ws("core").package(pkg("math")),

@@ -3,18 +3,22 @@
 //!
 //! A changed file with no indexed relationship to Rust source is normally
 //! treated as an unknown input, which widens selection to every workspace.
-//! Documentation, media, legal files, and CI, agent, and editor metadata are
-//! never compiled, executed, or opened by a build or test: a file that *is*
-//! embedded (`include!`, `include_str!`, `include_bytes!`, `#[path]`),
-//! configured (`[[rules]]`, `[[build-script-inputs]]`), or read at build time
-//! through a declared input is mapped before this classification runs, so
-//! those files never reach it.
+//! Documentation, media, legal files, CI, agent, and editor metadata, and
+//! JavaScript and TypeScript sources are not compiled, executed, or opened by a
+//! Cargo build or test: a file that *is* embedded (`include!`, `include_str!`,
+//! `include_bytes!`, `#[path]`), configured (`[[rules]]`,
+//! `[[build-script-inputs]]`), or read at build time through a declared input
+//! is mapped before this classification runs, so those files never reach it.
 //!
 //! The classification is deliberately narrow: files a build could read,
-//! execute, or consume as data (manifests, lockfiles, scripts, templates,
-//! schemas, fixtures, snapshots) stay conservative. Repositories extend the
-//! classes with `[[rules]] selection = "ignore"` and disable the built-in
-//! classes entirely with `default-inert-paths = false`.
+//! execute, or consume as data (manifests, lockfiles, data files, templates,
+//! schemas, fixtures, snapshots, scripts) stay conservative. The one executed
+//! exception is JavaScript and TypeScript source: Cargo never compiles, runs,
+//! or consumes it, and the toolchain that does is invisible to the index, so
+//! the file behaves like documentation. Repositories whose Rust builds or
+//! tests do read JavaScript or TypeScript trees map those paths back in with
+//! `[[rules]]`, extend the classes with `[[rules]] selection = "ignore"`, and
+//! disable the built-in classes entirely with `default-inert-paths = false`.
 
 /// Directory names whose contents are repository metadata: continuous
 /// integration, coding agents, and editor configuration. None of them are
@@ -59,6 +63,13 @@ const INERT_EXTENSIONS: &[&str] = &[
 /// Extensions allowed on metadata-prefixed files (`LICENSE.txt`).
 const METADATA_FILE_EXTENSIONS: &[&str] = &["adoc", "md", "rst", "txt"];
 
+/// Extensions of JavaScript and TypeScript sources. Cargo never compiles,
+/// runs, or consumes them; the toolchain that does is outside the index, and
+/// a file a Rust build or test reads is mapped before this check (indexed
+/// includes, configured rules).
+const JAVASCRIPT_SOURCE_EXTENSIONS: &[&str] =
+    &["cjs", "cts", "js", "jsx", "mjs", "mts", "ts", "tsx"];
+
 /// Returns the reason the file cannot be an input to a build or test.
 pub(crate) fn classify(path: &str) -> Option<&'static str> {
     if path.split('/').any(in_metadata_directory) {
@@ -75,6 +86,9 @@ pub(crate) fn classify(path: &str) -> Option<&'static str> {
     let extension = lower.rsplit_once('.').map(|(_, extension)| extension);
     if extension.is_some_and(|extension| INERT_EXTENSIONS.contains(&extension)) {
         return Some("documentation, media, and fonts are not build inputs unless indexed");
+    }
+    if extension.is_some_and(|extension| JAVASCRIPT_SOURCE_EXTENSIONS.contains(&extension)) {
+        return Some("JavaScript and TypeScript sources are not built or run by Cargo");
     }
     if metadata_prefix_matches(&lower, extension) {
         return Some("legal, release, and community files are not build inputs");
@@ -134,14 +148,24 @@ mod tests {
     }
 
     #[test]
+    fn classifies_javascript_and_typescript_sources() {
+        assert!(classify("web/src/main.ts").is_some());
+        assert!(classify("ts/dashboard/src/app.tsx").is_some());
+        assert!(classify("rise/ts/src/api/client.js").is_some());
+        assert!(classify("scripts/report.mjs").is_some());
+        assert!(classify("tools/legacy/run.cjs").is_some());
+        assert!(classify("web/src/types.d.ts").is_some());
+    }
+
+    #[test]
     fn keeps_source_and_data_conservative() {
         assert!(classify("configs/market.toml").is_none());
         assert!(classify("dev-config.yaml").is_none());
         assert!(classify("programs/idl/ember.json").is_none());
+        assert!(classify("ts/idl-tool/package.json").is_none());
         assert!(classify("localnet-config.toml").is_none());
         assert!(classify("nodes/db/migrations/0001_init.sql").is_none());
         assert!(classify("scripts/verify-idl.py").is_none());
-        assert!(classify("ts/idl-tool/src/codama.ts").is_none());
         assert!(classify("mise.toml").is_none());
         assert!(classify("tests/fixtures/expected.snap").is_none());
         assert!(classify("crates/api/tests/expected.txt").is_none());
