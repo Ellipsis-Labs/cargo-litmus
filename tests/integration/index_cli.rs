@@ -213,6 +213,66 @@ fn indexes_cross_workspace_path_dependencies() {
 }
 
 #[test]
+fn indexes_same_basename_single_package_workspaces_by_package_name() {
+    let repo = tracked_repo(&[
+        (
+            "sdk/programs/eternal/fuzz/Cargo.toml",
+            concat!(
+                "[package]\n",
+                "name = \"phoenix-market-fuzz\"\n",
+                "version = \"0.1.0\"\n",
+                "edition = \"2024\"\n\n",
+                "[workspace]\n",
+                "members = [\".\"]\n",
+                "resolver = \"2\"\n",
+            ),
+        ),
+        (
+            "sdk/programs/eternal/fuzz/src/lib.rs",
+            "pub fn market() {}\n",
+        ),
+        (
+            "program-core/sokoban/fuzz/Cargo.toml",
+            concat!(
+                "[package]\n",
+                "name = \"sokoban-fuzz\"\n",
+                "version = \"0.1.0\"\n",
+                "edition = \"2024\"\n\n",
+                "[workspace]\n",
+                "members = [\".\"]\n",
+                "resolver = \"2\"\n",
+            ),
+        ),
+        (
+            "program-core/sokoban/fuzz/src/lib.rs",
+            "pub fn sokoban() {}\n",
+        ),
+    ]);
+
+    let (metadata, _summary) = build_index(&IndexOptions {
+        root: repo.path().to_path_buf(),
+        cache_path: None,
+    })
+    .unwrap();
+
+    let market = metadata
+        .packages
+        .iter()
+        .find(|package| package.name == "phoenix-market-fuzz")
+        .unwrap();
+    let sokoban = metadata
+        .packages
+        .iter()
+        .find(|package| package.name == "sokoban-fuzz")
+        .unwrap();
+
+    assert_eq!(market.workspace, "phoenix-market-fuzz");
+    assert_eq!(market.workspace_path, "sdk/programs/eternal/fuzz");
+    assert_eq!(sokoban.workspace, "sokoban-fuzz");
+    assert_eq!(sokoban.workspace_path, "program-core/sokoban/fuzz");
+}
+
+#[test]
 fn cargo_metadata_failure_fails_index_build() {
     let repo = tracked_repo(&[
         (

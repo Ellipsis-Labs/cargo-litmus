@@ -145,6 +145,8 @@ paths = ["codegen/**"]
 packages = ["generated-client"]
 ```
 
+For `selection = "workspace"`, a single-package workspace whose package is declared at its root uses that package's Cargo name as its workspace identifier. Virtual and multi-package workspaces keep the workspace root directory name. This distinguishes independent workspaces that share a directory name, such as separate `fuzz/` directories.
+
 Patterns are `globset` globs: `*`, `**`, `?`, character classes (`[abc]`, `[!abc]`), and `{a,b}` alternates (`*.{js,jsx,ts,tsx}`) are supported. Patterns match repository-relative paths.
 
 A path matched by several rules is a real input if any matching rule selects workspaces or packages; it is inert only when *every* matching rule ignores it. A broad `selection = "ignore"` rule therefore cannot shadow a narrower mapping rule, whatever the order in the file.

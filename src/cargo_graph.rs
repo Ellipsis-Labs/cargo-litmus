@@ -67,7 +67,7 @@ fn cargo_graph_from_metadata(root: &Path, metadata_reports: Vec<(String, Metadat
         .map(|(_, metadata)| {
             let workspace_root =
                 normalize_metadata_path(root, metadata.workspace_root.as_std_path());
-            let workspace_name = workspace_name(&workspace_root);
+            let workspace_name = workspace_name(&workspace_root, metadata);
             (workspace_root, workspace_name)
         })
         .collect::<BTreeMap<_, _>>();
@@ -338,7 +338,17 @@ fn workspace_root_for_package_root(
         .map(|(workspace_root, _)| workspace_root.clone())
 }
 
-fn workspace_name(workspace_root: &str) -> String {
+fn workspace_name(workspace_root: &str, metadata: &Metadata) -> String {
+    if metadata.workspace_members.len() == 1 {
+        if let Some(package) = metadata.packages.iter().find(|package| {
+            package.id == metadata.workspace_members[0]
+                && package.manifest_path.as_std_path().parent()
+                    == Some(metadata.workspace_root.as_std_path())
+        }) {
+            return package.name.to_string();
+        }
+    }
+
     Path::new(workspace_root)
         .file_name()
         .and_then(|name| name.to_str())
