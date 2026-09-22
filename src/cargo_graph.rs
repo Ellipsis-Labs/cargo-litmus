@@ -339,14 +339,10 @@ fn workspace_root_for_package_root(
 }
 
 fn workspace_name(workspace_root: &str, metadata: &Metadata) -> String {
-    if metadata.workspace_members.len() == 1 {
-        if let Some(package) = metadata.packages.iter().find(|package| {
-            package.id == metadata.workspace_members[0]
-                && package.manifest_path.as_std_path().parent()
-                    == Some(metadata.workspace_root.as_std_path())
-        }) {
-            return package.name.to_string();
-        }
+    if let Some(package) = metadata.packages.iter().find(|package| {
+        package.manifest_path.as_std_path().parent() == Some(metadata.workspace_root.as_std_path())
+    }) {
+        return package.name.to_string();
     }
 
     Path::new(workspace_root)

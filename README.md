@@ -145,7 +145,7 @@ paths = ["codegen/**"]
 packages = ["generated-client"]
 ```
 
-For `selection = "workspace"`, a single-package workspace whose package is declared at its root uses that package's Cargo name as its workspace identifier. Virtual and multi-package workspaces keep the workspace root directory name. This distinguishes independent workspaces that share a directory name, such as separate `fuzz/` directories.
+For `selection = "workspace"`, a workspace whose root manifest declares `[package]` uses that package's Cargo name as its workspace identifier, regardless of its member count. Virtual workspaces use their root directory name.
 
 Patterns are `globset` globs: `*`, `**`, `?`, character classes (`[abc]`, `[!abc]`), and `{a,b}` alternates (`*.{js,jsx,ts,tsx}`) are supported. Patterns match repository-relative paths.
 

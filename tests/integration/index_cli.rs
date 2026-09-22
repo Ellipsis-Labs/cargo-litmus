@@ -213,13 +213,39 @@ fn indexes_cross_workspace_path_dependencies() {
 }
 
 #[test]
-fn indexes_same_basename_single_package_workspaces_by_package_name() {
+fn indexes_package_root_workspaces_with_shared_directory_names() {
     let repo = tracked_repo(&[
         (
-            "sdk/programs/eternal/fuzz/Cargo.toml",
+            "crates/alpha/fuzz/Cargo.toml",
             concat!(
                 "[package]\n",
-                "name = \"phoenix-market-fuzz\"\n",
+                "name = \"alpha-fuzz\"\n",
+                "version = \"0.1.0\"\n",
+                "edition = \"2024\"\n\n",
+                "[workspace]\n",
+                "members = [\".\", \"support\"]\n",
+                "resolver = \"2\"\n",
+            ),
+        ),
+        ("crates/alpha/fuzz/src/lib.rs", "pub fn alpha() {}\n"),
+        (
+            "crates/alpha/fuzz/support/Cargo.toml",
+            concat!(
+                "[package]\n",
+                "name = \"alpha-fuzz-support\"\n",
+                "version = \"0.1.0\"\n",
+                "edition = \"2024\"\n",
+            ),
+        ),
+        (
+            "crates/alpha/fuzz/support/src/lib.rs",
+            "pub fn support() {}\n",
+        ),
+        (
+            "crates/beta/fuzz/Cargo.toml",
+            concat!(
+                "[package]\n",
+                "name = \"beta-fuzz\"\n",
                 "version = \"0.1.0\"\n",
                 "edition = \"2024\"\n\n",
                 "[workspace]\n",
@@ -227,26 +253,7 @@ fn indexes_same_basename_single_package_workspaces_by_package_name() {
                 "resolver = \"2\"\n",
             ),
         ),
-        (
-            "sdk/programs/eternal/fuzz/src/lib.rs",
-            "pub fn market() {}\n",
-        ),
-        (
-            "program-core/sokoban/fuzz/Cargo.toml",
-            concat!(
-                "[package]\n",
-                "name = \"sokoban-fuzz\"\n",
-                "version = \"0.1.0\"\n",
-                "edition = \"2024\"\n\n",
-                "[workspace]\n",
-                "members = [\".\"]\n",
-                "resolver = \"2\"\n",
-            ),
-        ),
-        (
-            "program-core/sokoban/fuzz/src/lib.rs",
-            "pub fn sokoban() {}\n",
-        ),
+        ("crates/beta/fuzz/src/lib.rs", "pub fn beta() {}\n"),
     ]);
 
     let (metadata, _summary) = build_index(&IndexOptions {
@@ -255,21 +262,28 @@ fn indexes_same_basename_single_package_workspaces_by_package_name() {
     })
     .unwrap();
 
-    let market = metadata
+    let alpha = metadata
         .packages
         .iter()
-        .find(|package| package.name == "phoenix-market-fuzz")
+        .find(|package| package.name == "alpha-fuzz")
         .unwrap();
-    let sokoban = metadata
+    let alpha_support = metadata
         .packages
         .iter()
-        .find(|package| package.name == "sokoban-fuzz")
+        .find(|package| package.name == "alpha-fuzz-support")
+        .unwrap();
+    let beta = metadata
+        .packages
+        .iter()
+        .find(|package| package.name == "beta-fuzz")
         .unwrap();
 
-    assert_eq!(market.workspace, "phoenix-market-fuzz");
-    assert_eq!(market.workspace_path, "sdk/programs/eternal/fuzz");
-    assert_eq!(sokoban.workspace, "sokoban-fuzz");
-    assert_eq!(sokoban.workspace_path, "program-core/sokoban/fuzz");
+    assert_eq!(alpha.workspace, "alpha-fuzz");
+    assert_eq!(alpha.workspace_path, "crates/alpha/fuzz");
+    assert_eq!(alpha_support.workspace, "alpha-fuzz");
+    assert_eq!(alpha_support.workspace_path, "crates/alpha/fuzz");
+    assert_eq!(beta.workspace, "beta-fuzz");
+    assert_eq!(beta.workspace_path, "crates/beta/fuzz");
 }
 
 #[test]
