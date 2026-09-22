@@ -105,6 +105,11 @@ jobs:
       - name: Upload cache misses to Nix cache
         if: always()
         run: |
+          # Fork PRs get no repo secrets: skip loudly instead of failing.
+          if [ -z "${AWS_ACCESS_KEY_ID:-}" ] || [ -z "${AWS_SECRET_ACCESS_KEY:-}" ]; then
+            echo "::warning::No R2 credentials (fork PR or missing repo secrets); skipping cache upload"
+            exit 0
+          fi
           # Check if we have any locally built paths to upload
           if [ -f /tmp/locally-built-paths.txt ] && [ -s /tmp/locally-built-paths.txt ]; then
             # Remove duplicates and empty lines
