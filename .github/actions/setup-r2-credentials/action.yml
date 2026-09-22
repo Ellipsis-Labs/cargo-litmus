@@ -14,5 +14,12 @@ runs:
     - name: Configure R2 credentials
       shell: bash
       run: |
+        # nix-quick-install-action is single-user (no nix-daemon); the store
+        # is owned by the runner user, so AWS SDK env vars set here reach
+        # every later `nix` invocation via $GITHUB_ENV. No daemon env needed.
         echo "AWS_ACCESS_KEY_ID=${{ inputs.r2-access-key-id }}" >> $GITHUB_ENV
         echo "AWS_SECRET_ACCESS_KEY=${{ inputs.r2-secret-access-key }}" >> $GITHUB_ENV
+        # R2's S3 region is `auto`; pin it so SigV4 signs what R2 expects.
+        echo "AWS_REGION=auto" >> $GITHUB_ENV
+        # Runners have no EC2 metadata service; skip the IMDS lookup.
+        echo "AWS_EC2_METADATA_DISABLED=true" >> $GITHUB_ENV

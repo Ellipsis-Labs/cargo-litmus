@@ -17,7 +17,7 @@ env:
   CARGO_INCREMENTAL: 0
   CARGO_TERM_COLOR: always
   NIX_SIGNING_PUBLIC_KEY: "ellipsis-labs:eug33YU0s2/K/BgiOtEta1cwNIzERtIybNATLOBsrEA="
-  NIX_CACHE_URI: "s3://atlas-nix-cache?compression=zstd&parallel-compression=true&endpoint=6a2b885167c20bd5dd1d3bcb4b09760f.r2.cloudflarestorage.com"
+  NIX_CACHE_URI: "s3://atlas-nix-cache?region=auto&scheme=https&compression=zstd&parallel-compression=true&endpoint=6a2b885167c20bd5dd1d3bcb4b09760f.r2.cloudflarestorage.com"
 
 jobs:
   check:
