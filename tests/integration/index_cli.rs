@@ -213,6 +213,80 @@ fn indexes_cross_workspace_path_dependencies() {
 }
 
 #[test]
+fn indexes_package_root_workspaces_with_shared_directory_names() {
+    let repo = tracked_repo(&[
+        (
+            "crates/alpha/fuzz/Cargo.toml",
+            concat!(
+                "[package]\n",
+                "name = \"alpha-fuzz\"\n",
+                "version = \"0.1.0\"\n",
+                "edition = \"2024\"\n\n",
+                "[workspace]\n",
+                "members = [\".\", \"support\"]\n",
+                "resolver = \"2\"\n",
+            ),
+        ),
+        ("crates/alpha/fuzz/src/lib.rs", "pub fn alpha() {}\n"),
+        (
+            "crates/alpha/fuzz/support/Cargo.toml",
+            concat!(
+                "[package]\n",
+                "name = \"alpha-fuzz-support\"\n",
+                "version = \"0.1.0\"\n",
+                "edition = \"2024\"\n",
+            ),
+        ),
+        (
+            "crates/alpha/fuzz/support/src/lib.rs",
+            "pub fn support() {}\n",
+        ),
+        (
+            "crates/beta/fuzz/Cargo.toml",
+            concat!(
+                "[package]\n",
+                "name = \"beta-fuzz\"\n",
+                "version = \"0.1.0\"\n",
+                "edition = \"2024\"\n\n",
+                "[workspace]\n",
+                "members = [\".\"]\n",
+                "resolver = \"2\"\n",
+            ),
+        ),
+        ("crates/beta/fuzz/src/lib.rs", "pub fn beta() {}\n"),
+    ]);
+
+    let (metadata, _summary) = build_index(&IndexOptions {
+        root: repo.path().to_path_buf(),
+        cache_path: None,
+    })
+    .unwrap();
+
+    let alpha = metadata
+        .packages
+        .iter()
+        .find(|package| package.name == "alpha-fuzz")
+        .unwrap();
+    let alpha_support = metadata
+        .packages
+        .iter()
+        .find(|package| package.name == "alpha-fuzz-support")
+        .unwrap();
+    let beta = metadata
+        .packages
+        .iter()
+        .find(|package| package.name == "beta-fuzz")
+        .unwrap();
+
+    assert_eq!(alpha.workspace, "alpha-fuzz");
+    assert_eq!(alpha.workspace_path, "crates/alpha/fuzz");
+    assert_eq!(alpha_support.workspace, "alpha-fuzz");
+    assert_eq!(alpha_support.workspace_path, "crates/alpha/fuzz");
+    assert_eq!(beta.workspace, "beta-fuzz");
+    assert_eq!(beta.workspace_path, "crates/beta/fuzz");
+}
+
+#[test]
 fn cargo_metadata_failure_fails_index_build() {
     let repo = tracked_repo(&[
         (

@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 use serde::{Deserialize, Serialize};
 
-pub const INDEX_VERSION: u32 = 8;
+pub const INDEX_VERSION: u32 = 9;
 
 #[derive(
     Archive, RkyvDeserialize, RkyvSerialize, Clone, Debug, Deserialize, PartialEq, Serialize,
