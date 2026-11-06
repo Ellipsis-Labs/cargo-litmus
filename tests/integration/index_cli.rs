@@ -57,6 +57,53 @@ fn indexes_tracked_rust_files_and_writes_default_cache() {
 }
 
 #[test]
+fn conditional_module_paths_reach_every_possible_source() {
+    let repo = tracked_repo(&[
+        (
+            "src/lib.rs",
+            "#[cfg_attr(unix, path = \"unix.rs\")]\nmod platform;\n",
+        ),
+        ("src/unix.rs", "pub fn platform() {}\n"),
+        ("src/platform.rs", "pub fn platform() {}\n"),
+    ]);
+    let (metadata, _) = build_index(&IndexOptions {
+        root: repo.path().to_path_buf(),
+        cache_path: None,
+    })
+    .unwrap();
+    let module = metadata
+        .items
+        .iter()
+        .find(|item| {
+            item.name == "platform"
+                && item.file_id
+                    == metadata
+                        .files
+                        .iter()
+                        .find(|file| file.path == "src/lib.rs")
+                        .unwrap()
+                        .id
+        })
+        .unwrap();
+    for path in ["src/unix.rs", "src/platform.rs"] {
+        let file = metadata
+            .files
+            .iter()
+            .find(|file| file.path == path)
+            .unwrap();
+        assert!(
+            metadata
+                .edges
+                .iter()
+                .any(|edge| edge.kind == EdgeKind::ModuleDeclares
+                    && edge.from == module.id
+                    && edge.to == file.id),
+            "missing module edge to {path}"
+        );
+    }
+}
+
+#[test]
 fn indexes_cargo_package_targets_and_dependencies() {
     let repo = tracked_repo(&[
         (
@@ -581,13 +628,9 @@ fn incremental_index_reuses_unchanged_files_and_reparses_changed_files() {
         cache_path: Some(cache.clone()),
     })
     .unwrap();
-    fs::write(
-        repo.path().join("src/foo.rs"),
-        "pub fn foo() {}\n// changed\n",
-    )
-    .unwrap();
+    fs::write(repo.path().join("src/foo.rs"), "pub fn changed_foo() {}\n").unwrap();
 
-    let (_metadata, summary) = build_or_update_index(
+    let (metadata, summary) = build_or_update_index(
         &IndexOptions {
             root: repo.path().to_path_buf(),
             cache_path: Some(cache),
@@ -599,6 +642,40 @@ fn incremental_index_reuses_unchanged_files_and_reparses_changed_files() {
     assert_eq!(summary.index_mode, IndexMode::IncrementalUpdate);
     assert_eq!(summary.files_reused, 1);
     assert_eq!(summary.files_reparsed, 1);
+    let foo = metadata
+        .files
+        .iter()
+        .find(|file| file.path == "src/foo.rs")
+        .unwrap();
+    let root = metadata
+        .files
+        .iter()
+        .find(|file| file.path == "src/lib.rs")
+        .unwrap();
+    assert!(
+        metadata
+            .items
+            .iter()
+            .any(|item| item.file_id == foo.id && item.name == "changed_foo")
+    );
+    assert!(
+        !metadata
+            .items
+            .iter()
+            .any(|item| item.file_id == foo.id && item.name == "foo")
+    );
+    assert!(
+        metadata
+            .items
+            .iter()
+            .any(|item| item.file_id == root.id && item.name == "root")
+    );
+    assert!(
+        metadata
+            .edges
+            .iter()
+            .any(|edge| edge.kind == EdgeKind::ModuleDeclares && edge.to == foo.id)
+    );
 }
 
 #[test]
@@ -1196,4 +1273,210 @@ fn affected_malformed_current_source_fails_wide() {
 
     assert!(report.failed_wide);
     assert_eq!(report.affected_workspaces.len(), 2);
+}
+
+struct RootPathFerrisRunner(FerrisAffectedReport);
+
+impl FerrisRunner for RootPathFerrisRunner {
+    fn ripples(
+        &self,
+        _root: &Path,
+        _files: &[String],
+    ) -> cargo_litmus::Result<FerrisAffectedReport> {
+        Ok(self.0.clone())
+    }
+
+    fn lineup(&self, _root: &Path) -> cargo_litmus::Result<FerrisAffectedReport> {
+        Ok(self.0.clone())
+    }
+}
+
+fn root_path_fixture(package_root: &str) -> (TempDir, RootPathFerrisRunner) {
+    let files = [
+        (
+            "Cargo.toml",
+            concat!(
+                "[package]\nname = \"root-library\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+                "[workspace]\nmembers = [\"downstream\"]\nresolver = \"2\"\n",
+            ),
+        ),
+        ("src/lib.rs", "pub mod tests;\nmod feature;\n"),
+        ("src/tests/mod.rs", "pub fn production() -> u32 { 1 }\n"),
+        (
+            "src/feature.rs",
+            "#[cfg(test)]\nmod tests {\n    #[test]\n    fn works() {}\n}\n",
+        ),
+        (
+            "tests/integration.rs",
+            "mod helper;\n#[test]\nfn works() { helper::check(); }\n",
+        ),
+        ("tests/helper/mod.rs", "pub fn check() {}\n"),
+        (
+            "downstream/Cargo.toml",
+            concat!(
+                "[package]\nname = \"downstream\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+                "[dependencies]\nroot-library = { path = \"..\" }\n",
+            ),
+        ),
+        (
+            "downstream/src/lib.rs",
+            "#[test]\nfn observes_production() { assert_eq!(root_library::tests::production(), \
+             1); }\n",
+        ),
+    ];
+    let files = files
+        .into_iter()
+        .map(|(path, contents)| {
+            let path = if package_root.is_empty() {
+                path.to_string()
+            } else {
+                format!("{package_root}/{path}")
+            };
+            (path, contents)
+        })
+        .collect::<Vec<_>>();
+    let repo = tracked_repo(
+        &files
+            .iter()
+            .map(|(path, contents)| (path.as_str(), *contents))
+            .collect::<Vec<_>>(),
+    );
+    let (metadata, _) = build_index(&IndexOptions {
+        root: repo.path().to_path_buf(),
+        cache_path: None,
+    })
+    .unwrap();
+    let root_package = metadata
+        .packages
+        .iter()
+        .find(|package| package.name == "root-library")
+        .unwrap();
+    let downstream = metadata
+        .packages
+        .iter()
+        .find(|package| package.name == "downstream")
+        .unwrap();
+    assert!(metadata.package_dependencies.iter().any(|dependency| {
+        dependency.package_id == downstream.id
+            && dependency.depends_on_package_id == root_package.id
+    }));
+    let workspace = AffectedWorkspace {
+        name: root_package.workspace.clone(),
+        path: root_package.workspace_path.clone(),
+    };
+    let runner = RootPathFerrisRunner(FerrisAffectedReport {
+        affected_crates: [root_package, downstream]
+            .into_iter()
+            .map(|package| AffectedCrate {
+                name: package.name.clone(),
+                workspace: package.workspace.clone(),
+                is_directly_affected: package.id == root_package.id,
+                is_standalone: false,
+            })
+            .collect(),
+        affected_workspaces: vec![workspace.clone()],
+        directly_affected_crates: vec![root_package.name.clone()],
+        directly_affected_workspaces: vec![workspace],
+    });
+    (repo, runner)
+}
+
+#[test]
+fn production_tests_directory_retains_dependent_tests_for_root_and_nested_packages() {
+    for package_root in ["", "core"] {
+        let (repo, runner) = root_path_fixture(package_root);
+        let path = if package_root.is_empty() {
+            "src/tests/mod.rs".to_string()
+        } else {
+            format!("{package_root}/src/tests/mod.rs")
+        };
+        fs::write(
+            repo.path().join(&path),
+            "pub fn production() -> u32 { 2 }\n",
+        )
+        .unwrap();
+        let report = compute_affected(
+            &AffectedOptions {
+                root: repo.path().to_path_buf(),
+                files: vec![path],
+                changed_files: Vec::new(),
+                base_cache: None,
+                current_cache: None,
+            },
+            &runner,
+        )
+        .unwrap();
+
+        assert!(!report.failed_wide, "package root: {package_root:?}");
+        assert!(!report.test_failed_wide, "package root: {package_root:?}");
+        for package in ["root-library", "downstream"] {
+            assert!(
+                report
+                    .affected_test_crates
+                    .iter()
+                    .any(|krate| krate.name == package),
+                "missing {package} for package root {package_root:?}",
+            );
+        }
+    }
+}
+
+#[test]
+fn root_package_cfg_test_module_keeps_qualified_filter() {
+    let (repo, runner) = root_path_fixture("");
+    let report = compute_affected(
+        &AffectedOptions {
+            root: repo.path().to_path_buf(),
+            files: Vec::new(),
+            changed_files: vec![ChangedFileInput {
+                path: "src/feature.rs".to_string(),
+                ranges: vec![cargo_litmus::changed_files::ChangedLineRange {
+                    start_line: 4,
+                    end_line: 4,
+                }],
+            }],
+            base_cache: None,
+            current_cache: None,
+        },
+        &runner,
+    )
+    .unwrap();
+
+    assert!(!report.failed_wide);
+    assert!(!report.test_failed_wide);
+    assert_eq!(report.affected_test_crates.len(), 1);
+    assert_eq!(report.affected_test_crates[0].name, "root-library");
+    assert_eq!(report.nextest_commands.len(), 1);
+    assert_eq!(
+        report.nextest_commands[0].module_filter.as_deref(),
+        Some("feature::tests"),
+    );
+}
+
+#[test]
+fn integration_test_helpers_stay_package_local_for_root_and_nested_packages() {
+    for package_root in ["", "core"] {
+        let (repo, runner) = root_path_fixture(package_root);
+        let path = if package_root.is_empty() {
+            "tests/helper/mod.rs".to_string()
+        } else {
+            format!("{package_root}/tests/helper/mod.rs")
+        };
+        let report = compute_affected(
+            &AffectedOptions {
+                root: repo.path().to_path_buf(),
+                files: vec![path],
+                changed_files: Vec::new(),
+                base_cache: None,
+                current_cache: None,
+            },
+            &runner,
+        )
+        .unwrap();
+
+        assert!(!report.failed_wide, "package root: {package_root:?}");
+        assert!(!report.test_failed_wide, "package root: {package_root:?}");
+        assert_eq!(report.affected_test_crates.len(), 1);
+        assert_eq!(report.affected_test_crates[0].name, "root-library");
+    }
 }

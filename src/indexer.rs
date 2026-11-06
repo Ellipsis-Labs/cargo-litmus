@@ -150,7 +150,6 @@ pub fn build_or_update_index(
         } else {
             None
         };
-    let previous_lookup = PreviousIndexLookup::new(&previous);
     let discovered_paths = discovery
         .files
         .iter()
@@ -170,6 +169,9 @@ pub fn build_or_update_index(
         .map(|file| (file.path.clone(), file))
         .collect();
 
+    // Keep reused files as paths until an update is known to be necessary.
+    // A warm lookup can return the loaded index without cloning its item graph.
+    let mut reused_paths = Vec::new();
     let mut parsed_files = Vec::new();
     let mut files_reused = 0;
     let mut files_reparsed = 0;
@@ -184,10 +186,7 @@ pub fn build_or_update_index(
                 let current_hash = source_file_hash(source_file)?;
                 if previous_file.hash == current_hash {
                     files_reused += 1;
-                    parsed_files.push(ParsedSourceFile::from_previous_lookup(
-                        &previous_lookup,
-                        path,
-                    ));
+                    reused_paths.push(path.as_str());
                 } else {
                     let parsed = parse_source_file(source_file)?;
                     files_reparsed += 1;
@@ -195,18 +194,12 @@ pub fn build_or_update_index(
                 }
             } else if unchanged_file_list && !portable_cache {
                 files_reused += 1;
-                parsed_files.push(ParsedSourceFile::from_previous_lookup(
-                    &previous_lookup,
-                    path,
-                ));
+                reused_paths.push(path.as_str());
             } else {
                 let current_hash = source_file_hash(source_file)?;
                 if previous_file.hash == current_hash {
                     files_reused += 1;
-                    parsed_files.push(ParsedSourceFile::from_previous_lookup(
-                        &previous_lookup,
-                        path,
-                    ));
+                    reused_paths.push(path.as_str());
                 } else {
                     let parsed = parse_source_file(source_file)?;
                     files_reparsed += 1;
@@ -257,6 +250,15 @@ pub fn build_or_update_index(
             files_added,
         });
         return Ok((previous, summary));
+    }
+
+    if !reused_paths.is_empty() {
+        let previous_lookup = PreviousIndexLookup::new(&previous);
+        parsed_files.extend(
+            reused_paths
+                .into_iter()
+                .map(|path| ParsedSourceFile::from_previous_lookup(&previous_lookup, path)),
+        );
     }
 
     let mut metadata = metadata_from_parts(
@@ -498,10 +500,10 @@ fn rebuild_module_edges(metadata: &mut IndexMetadata) {
         .edges
         .retain(|edge| edge.kind != EdgeKind::ModuleDeclares);
     for declaration in &metadata.module_declarations {
-        if let Some(target_file_id) = declaration
+        for target_file_id in declaration
             .target_paths
             .iter()
-            .find_map(|path| file_ids_by_path.get(path))
+            .filter_map(|path| file_ids_by_path.get(path))
         {
             metadata.edges.push(Edge {
                 from: declaration.from_item_id.clone(),

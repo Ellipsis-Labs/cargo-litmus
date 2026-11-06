@@ -705,6 +705,120 @@ fn inert_manifest_change_stays_package_local() {
 }
 
 #[test]
+fn manifest_and_library_changes_keep_dependents_selected() {
+    let monorepo = Monorepo::new(vec![
+        ws("app")
+            .package(pkg("api"))
+            .package(pkg("consumer").dep("api"))
+            .package(pkg("unrelated")),
+    ]);
+    check(
+        "manifest_and_library_changes_keep_dependents_selected",
+        monorepo,
+        &[
+            edit(
+                "app/api/Cargo.toml",
+                "[package]\nname = \"api\"\nversion = \"0.1.0\"\nedition = \"2021\"\ndescription \
+                 = \"api crate\"\n",
+            ),
+            edit("app/api/src/lib.rs", "pub fn api() -> u32 { 2 }\n"),
+        ],
+        &Expect::exact(&[target("app/api"), target("app/consumer")])
+            .note("package metadata cannot hide a production change in the same package"),
+    );
+}
+
+#[test]
+fn bin_and_library_changes_keep_dependents_selected() {
+    let monorepo = Monorepo::new(vec![
+        ws("app")
+            .package(pkg("api").file("src/main.rs", "fn main() {}\n"))
+            .package(pkg("consumer").dep("api"))
+            .package(pkg("unrelated")),
+    ]);
+    check(
+        "bin_and_library_changes_keep_dependents_selected",
+        monorepo,
+        &[
+            edit(
+                "app/api/src/main.rs",
+                "fn main() { println!(\"changed\"); }\n",
+            ),
+            edit("app/api/src/lib.rs", "pub fn api() -> u32 { 2 }\n"),
+        ],
+        &Expect::exact(&[target("app/api"), target("app/consumer")])
+            .note("a binary entrypoint cannot hide a library change in the same package"),
+    );
+}
+
+#[test]
+fn bin_entrypoint_only_change_stays_package_local() {
+    let monorepo = Monorepo::new(vec![
+        ws("app")
+            .package(pkg("api").file("src/main.rs", "fn main() {}\n"))
+            .package(pkg("consumer").dep("api")),
+    ]);
+    check(
+        "bin_entrypoint_only_change_stays_package_local",
+        monorepo,
+        &[edit(
+            "app/api/src/main.rs",
+            "fn main() { println!(\"changed\"); }\n",
+        )],
+        &Expect::exact(&[target("app/api")])
+            .note("a binary entrypoint not included elsewhere cannot affect library consumers"),
+    );
+}
+
+#[test]
+fn included_bin_entrypoint_change_keeps_dependents_selected() {
+    let monorepo = Monorepo::new(vec![
+        ws("app")
+            .package(
+                pkg("api")
+                    .lib_source("include!(\"main.rs\");\n\npub fn api() -> u32 { 1 }\n")
+                    .file("src/main.rs", "pub fn main() {}\n"),
+            )
+            .package(pkg("consumer").dep("api"))
+            .package(pkg("unrelated")),
+    ]);
+    check(
+        "included_bin_entrypoint_change_keeps_dependents_selected",
+        monorepo,
+        &[edit(
+            "app/api/src/main.rs",
+            "pub fn main() { println!(\"changed\"); }\n",
+        )],
+        &Expect::exact(&[target("app/api"), target("app/consumer")]).note(
+            "a binary entrypoint included by the library also changes production library code",
+        ),
+    );
+}
+
+#[test]
+fn included_manifest_change_keeps_dependents_selected() {
+    let monorepo = Monorepo::new(vec![
+        ws("app")
+            .package(
+                pkg("api")
+                    .lib_source("pub const MANIFEST: &str = include_str!(\"../Cargo.toml\");\n"),
+            )
+            .package(pkg("consumer").dep("api"))
+            .package(pkg("unrelated")),
+    ]);
+    check(
+        "included_manifest_change_keeps_dependents_selected",
+        monorepo,
+        &[edit(
+            "app/api/Cargo.toml",
+            "[package]\nname = \"api\"\nversion = \"0.1.0\"\nedition = \"2021\"\ndescription = \
+             \"embedded metadata\"\n",
+        )],
+        &Expect::exact(&[target("app/api"), target("app/consumer")]),
+    );
+}
+
+#[test]
 fn scripted_ferris_under_report_is_repaired_from_index_closure() {
     let monorepo = Monorepo::new(vec![
         ws("core")

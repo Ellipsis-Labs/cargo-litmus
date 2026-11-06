@@ -89,15 +89,26 @@ cargo litmus affected \
 
 `LITMUS_BASE_CACHE` provides the default `--base-cache` path. Cache metadata includes the repository root and source/Cargo fingerprints; incompatible or incomplete caches are rebuilt conservatively.
 
+Warm analysis reuses the loaded index without reconstructing its item graph when
+the supplied changes and repository fingerprints require no update.
+
+Index format version 10 rebuilds older caches to include conditional module-path
+dependencies; existing base caches should be regenerated for structural comparisons.
+
 ## How inputs select tests
 
 Litmus classifies every changed file, in this order:
 
 1. **Configured inputs** (`.cargo-litmus.toml`) select the workspaces or packages they name.
 2. **Cargo inputs** (`Cargo.toml`, `Cargo.lock`, `build.rs`, `.cargo/config.toml`, `rust-toolchain.toml`) select their owning package's closure, their workspace, or every workspace for configuration and toolchain files, which resolve by walking up the directory tree.
-3. **Indexed sources** map to their owning package and reverse dependents. Files embedded with `include!`, `include_str!`, `include_bytes!`, or `#[path]` map to the packages that embed them.
+3. **Indexed sources** map to their owning package and reverse dependents. Files embedded with `include!`, `include_str!`, `include_bytes!`, or `#[path]` map to the packages that embed them. Conditional `#[cfg_attr(..., path = "...")]` modules include every path alternative, including nested attributes and the default module location, without assuming a particular platform or feature set.
 4. **Inert inputs** select nothing and are not passed to `cargo-ferris-wheel`, whose ripple walk widens on files it cannot map. Documentation, media, fonts, legal and community files, container recipes, and CI, agent, and editor metadata cannot be compiled, executed, or read by a build unless an indexed source embeds them, which case 3 already covers. Inert classification stops at package roots: a file beneath a package root keeps its package's closure, because package code can read it through paths litmus cannot index (`CARGO_MANIFEST_DIR`, computed paths).
 5. **Any other file** is conservative: a file beneath a package root selects that package and its reverse dependents; a file inside a workspace but outside its packages (lockfile, workspace manifest, workspace data) widens to that workspace; a file outside every workspace widens to all of them.
+
+Package-local narrowing requires every changed path to qualify. A manifest or
+binary-entrypoint change cannot hide a simultaneous library change: dependent
+tests remain selected. A production module beneath `src/tests/` is not assumed
+test-only, including in crates at the repository root.
 
 The built-in inert classes are:
 
