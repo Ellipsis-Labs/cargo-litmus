@@ -4,72 +4,70 @@
 
 ![A glowing test train routed through the affected path in a Rust dependency rail yard](assets/cargo-litmus-hero.png)
 
-Conservatively select the Rust tests affected by a Git change.
+Select the Rust tests affected by a Git change and emit focused `cargo nextest` commands.
 
-`cargo-litmus` indexes Rust source relationships, combines them with Cargo package and workspace dependencies from [`cargo-ferris-wheel`](https://github.com/Ellipsis-Labs/cargo-ferris-wheel), and emits focused `cargo nextest` commands. When it cannot prove that a narrow selection is safe, it widens to package or workspace tests instead of risking a false negative.
+`cargo-litmus` indexes Rust source relationships, combines them with Cargo package and workspace dependency graphs from [`cargo-ferris-wheel`](https://github.com/Ellipsis-Labs/cargo-ferris-wheel), and narrows runs to affected modules, test targets, or packages when safe. Selection is conservative: when Litmus cannot prove a narrow filter is complete, it widens to the owning package, workspace, or repository instead of risking a false negative.
 
 ## Install
 
-`cargo-litmus` requires `cargo-ferris-wheel` for affected-package discovery. [`cargo-nextest`](https://nexte.st/) is optional unless you use `--validate-nextest` or execute the generated commands.
+`cargo-litmus` requires [`cargo-ferris-wheel`](https://github.com/Ellipsis-Labs/cargo-ferris-wheel) 1.1.4 or newer on `PATH`. Litmus invokes the `cargo-ferris-wheel` binary directly so workspace discovery works from monorepo roots without a root `Cargo.toml` and in environments where `cargo` is wrapped by a build cache such as `mbx`.
 
-Litmus invokes the `cargo-ferris-wheel` binary directly and requires version 1.1.4 or newer. Direct invocation works from monorepo roots without a root `Cargo.toml`, including environments where `cargo` is wrapped by a build cache such as mbx.
+[`cargo-nextest`](https://nexte.st/) is optional unless you execute the emitted commands or pass `--validate-nextest`. The minimum supported Rust version is 1.88.0.
 
 ```bash
-# Fastest when cargo-binstall is available.
+# Prebuilt binaries via cargo-binstall.
 cargo binstall cargo-litmus cargo-ferris-wheel cargo-nextest
 
-# Or build the two required Cargo subcommands from source.
+# Or build the required binaries from source.
 cargo install cargo-litmus cargo-ferris-wheel
 ```
 
-The minimum supported Rust version is 1.88.0.
-
 ## Quick start
 
-From the root of a Git repository containing one or more Cargo workspaces:
+Run from a Git repository (or subdirectory) containing one or more Cargo workspaces:
 
 ```bash
 # Build or update target/cargo-litmus.rkyv.
 cargo litmus index --root .
 
-# Select changes between the merge-base of origin/main and HEAD.
+# Select tests for changes between the merge-base of origin/main and HEAD.
 cargo litmus affected --root . --merge-base origin/main
 
-# Select current staged, unstaged, deleted, renamed, and untracked changes.
+# Select tests for staged, unstaged, deleted, renamed, and untracked worktree changes.
 cargo litmus affected --root . --worktree
 
-# Explain why a file or package selects tests.
+# Explain why a path or package selects tests and where selection widens.
 cargo litmus explain crates/api/src/lib.rs --root .
 cargo litmus explain --package api-server --root .
 ```
 
-The summary output includes selection and cache telemetry. Use `--format json` for the complete machine-readable report, or `--json-output <path>` to write that report while retaining summary telemetry on stdout.
+Default `summary` output prints selection and cache telemetry. Pass `--format json` to print the full machine-readable report to stdout, or `--json-output <path>` to write the JSON report to disk while keeping summary telemetry on stdout.
 
 ## Selecting changes
 
-The `affected` command accepts explicit paths as well as Git-native inputs:
+`affected` accepts explicit file lists or Git revisions:
 
 ```bash
-# Explicit paths.
+# Explicit repository-relative paths.
 cargo litmus affected --files crates/api/src/lib.rs crates/types/src/lib.rs
 
-# An exact revision range, including changed line ranges.
+# Exact revision range, including changed line ranges.
 cargo litmus affected --base origin/main --head HEAD
 
-# Only changes staged in the Git index.
+# Staged index changes only.
 cargo litmus affected --staged
 
 # Newline-delimited paths, a JSON array, or a JSON object on stdin.
 git diff --name-only origin/main...HEAD | cargo litmus affected --files-stdin
 ```
 
-`--merge-base`, `--worktree`, and `--staged` are mutually exclusive. Explicit `--files` can be combined with `--base` and `--head` to restrict revision analysis to those paths.
+`--merge-base`, `--worktree`, `--staged`, and `--base`/`--head` are mutually exclusive. Combine `--files` or `--files-stdin` with `--base` and `--head` to restrict revision-range and changed-line analysis to those paths.
 
 ## Index caches
 
-The current index defaults to `$CARGO_TARGET_DIR/cargo-litmus.rkyv`, or `target/cargo-litmus.rkyv` when `CARGO_TARGET_DIR` is unset. Override it with `--cache` for `index` or `--current-cache` for `affected` and `explain`.
+The current index defaults to `$CARGO_TARGET_DIR/cargo-litmus.rkyv`, or `target/cargo-litmus.rkyv` when `CARGO_TARGET_DIR` is unset. Override it with `--cache` (`index`) or `--current-cache` (`affected`, `explain`).
 
-For revision-aware CI, build an index at the base revision and pass it to the head analysis:
+For revision-aware CI, build an index at the base revision and pass it via `--base-cache` (or `LITMUS_BASE_CACHE`):
 
 ```bash
 base_sha="$(git merge-base origin/main HEAD)"
@@ -87,45 +85,40 @@ cargo litmus affected \
   --format json
 ```
 
-`LITMUS_BASE_CACHE` provides the default `--base-cache` path. Cache metadata includes the repository root and source/Cargo fingerprints; incompatible or incomplete caches are rebuilt conservatively.
+Cache metadata records the repository root and source/Cargo fingerprints. Missing, unreadable, or incompatible caches fall back to a conservative rebuild.
 
 ## How inputs select tests
 
-Litmus classifies every changed file, in this order:
+Litmus classifies each changed path in precedence order:
 
-1. **Configured inputs** (`.cargo-litmus.toml`) select the workspaces or packages they name.
-2. **Cargo inputs** (`Cargo.toml`, `Cargo.lock`, `build.rs`, `.cargo/config.toml`, `rust-toolchain.toml`) select their owning package's closure, their workspace, or every workspace for configuration and toolchain files, which resolve by walking up the directory tree.
-3. **Indexed sources** map to their owning package and reverse dependents. Files embedded with `include!`, `include_str!`, `include_bytes!`, or `#[path]` map to the packages that embed them.
-4. **Inert inputs** select nothing and are not passed to `cargo-ferris-wheel`, whose ripple walk widens on files it cannot map. Documentation, media, fonts, legal and community files, container recipes, and CI, agent, and editor metadata cannot be compiled, executed, or read by a build unless an indexed source embeds them, which case 3 already covers. Inert classification stops at package roots: a file beneath a package root keeps its package's closure, because package code can read it through paths litmus cannot index (`CARGO_MANIFEST_DIR`, computed paths).
-5. **Any other file** is conservative: a file beneath a package root selects that package and its reverse dependents; a file inside a workspace but outside its packages (lockfile, workspace manifest, workspace data) widens to that workspace; a file outside every workspace widens to all of them.
+1. **Configured inputs**: `.cargo-litmus.toml` rules select named workspaces, packages and reverse dependents, or explicitly ignore paths.
+2. **Cargo inputs**: `.cargo/config.toml` (`.cargo/config`) and `rust-toolchain.toml` (`rust-toolchain`) resolve up the directory tree and widen to every workspace. `Cargo.toml`, `Cargo.lock`, and `build.rs` select their owning package and reverse dependents, or widen to the owning workspace when outside any package.
+3. **Indexed and embedded sources**: Tracked `.rs` files map to their owning package and reverse dependents. Files referenced by `include!`, `include_str!`, `include_bytes!`, or `#[path]` map to the packages that embed them and their reverse dependents.
+4. **Generated paths** (`target/**`, `**/target/**`, `**/out/**`): Have no static source relationship and widen conservatively.
+5. **Built-in inert paths** (outside package roots, when `default-inert-paths = true`): Select nothing and are omitted from `cargo-ferris-wheel` queries, which would otherwise widen on unmapped files. Built-in inert classification stops at package roots: an unconfigured file beneath a package root still selects that package's closure because package code or tests can read files under `CARGO_MANIFEST_DIR` at runtime.
+6. **Unmapped files**: Select the owning package closure when beneath a package root, widen to the workspace when inside a workspace outside its packages, or widen to all workspaces when outside every workspace.
 
-The built-in inert classes are:
+Built-in inert classes:
 
-| class | examples |
+| Class | Examples |
 |---|---|
-| documentation and media | `*.md`, `*.mdx`, `*.rst`, `*.adoc`, `*.png`, `*.svg`, `*.pdf`, `*.woff2` |
+| Documentation, media, and fonts | `*.md`, `*.mdx`, `*.rst`, `*.adoc`, `*.png`, `*.svg`, `*.pdf`, `*.woff2` |
 | JavaScript and TypeScript sources | `*.ts`, `*.tsx`, `*.js`, `*.jsx`, `*.mjs`, `*.cjs`, `*.mts`, `*.cts` |
-| legal and community | `LICENSE*`, `COPYING*`, `NOTICE*`, `CHANGELOG*`, `CONTRIBUTING*`, `SECURITY*`, `CODEOWNERS` |
+| Legal, release, and community | `LICENSE*`, `COPYING*`, `NOTICE*`, `CHANGELOG*`, `CONTRIBUTING*`, `SECURITY*`, `CODEOWNERS`, `.cargo-litmus.toml` |
 | CI, agent, and editor metadata | `.github/**`, `.agents/**`, `.claude/**`, `.cursor/**`, `.devcontainer/**`, `.vscode/**`, `.idea/**` |
-| container recipes | `Dockerfile*`, `*.dockerfile`, `.dockerignore`, `docker-compose*.yml` |
+| Container recipes | `Dockerfile*`, `*.dockerfile`, `.dockerignore`, `docker-compose*.yml`, `docker-compose*.yaml` |
 
-JavaScript and TypeScript sources are classified inert because Cargo never compiles, runs, or consumes them; the toolchain that does is outside the index. Repositories whose Rust builds or tests read JavaScript or TypeScript trees map those paths back in with `[[rules]]`; configured rules win over inert classification.
+Custom builds, proc macros, or tests may consume otherwise inert files. Map those paths with `[[rules]]` or `[[build-script-inputs]]`, or set `default-inert-paths = false` to make all unconfigured files conservative.
 
-Data and configuration files (`*.toml`, `*.yaml`, `*.json`, `*.sql`, `*.snap`, scripts, templates) are never inert, because a build or test can read them at runtime. Declare them with `.cargo-litmus.toml` rules, or add `selection = "ignore"` rules for repository-specific trees that cannot affect tests:
+Other data and configuration files (`*.toml`, `*.yaml`, `*.json`, `*.sql`, `*.snap`), scripts, and templates remain conservative. JSON output includes each path's classification in `input_explanations`.
 
-```toml
-[[rules]]
-paths = ["ts/**", "dev-docs/**"]
-selection = "ignore"
-```
+## Configuration (`.cargo-litmus.toml`)
 
-Set `default-inert-paths = false` to disable the built-in classes and make every unmapped file conservative again. `--format json` reports every classification in `input_explanations`, including inert ones.
-
-## Repository-specific inputs
-
-Rust syntax and Cargo metadata cannot express every input to a build or test. Add `.cargo-litmus.toml` at the analyzed repository root to map migrations, schemas, generated inputs, or other files explicitly:
+Place `.cargo-litmus.toml` at the analyzed root to map non-Rust inputs, declare build-script inputs, or ignore repository-specific trees:
 
 ```toml
+default-inert-paths = true
+
 [[rules]]
 paths = ["migrations/**"]
 workspaces = ["server"]
@@ -137,7 +130,7 @@ packages = ["api-types", "api-server"]
 selection = "packages"
 
 [[rules]]
-paths = ["vendor/tooling/**"]
+paths = ["ts/**", "vendor/tooling/**"]
 selection = "ignore"
 
 [[build-script-inputs]]
@@ -145,23 +138,20 @@ paths = ["codegen/**"]
 packages = ["generated-client"]
 ```
 
-For `selection = "workspace"`, a workspace whose root manifest declares `[package]` uses that package's Cargo name as its workspace identifier, regardless of its member count. Virtual workspaces use their root directory name.
-
-Patterns are `globset` globs: `*`, `**`, `?`, character classes (`[abc]`, `[!abc]`), and `{a,b}` alternates (`*.{js,jsx,ts,tsx}`) are supported. Patterns match repository-relative paths.
-
-A path matched by several rules is a real input if any matching rule selects workspaces or packages; it is inert only when *every* matching rule ignores it. A broad `selection = "ignore"` rule therefore cannot shadow a narrower mapping rule, whatever the order in the file.
-
-Rules are strict: unknown fields, invalid globs, and empty or contradictory selections are errors. Inputs that remain unmapped and are not classified inert widen selection rather than being ignored.
+- **Workspace names**: For `selection = "workspace"`, a workspace whose root `Cargo.toml` declares `[package]` uses that package's Cargo name regardless of member count. Virtual workspaces use their root directory name (or `"root"` at the repository root).
+- **Globs**: `paths` use `globset` syntax (`*`, `**`, `?`, `[abc]`, `[!abc]`, `{a,b}`) matched against repository-relative paths.
+- **Precedence**: A path matched by multiple rules selects targets if *any* matching rule selects workspaces or packages; it is ignored only when *every* matching rule sets `selection = "ignore"`, regardless of rule order.
+- **Validation**: Unknown fields, invalid globs, empty path or target lists, contradictory `ignore` targets, and unknown workspace or package names return an error.
 
 ## Optional nextest validation
 
-Pass `--validate-nextest` to `affected` or path-based `explain` to resolve the emitted filters with `cargo nextest list`. This can compile repository code and execute build scripts, so only enable it for trusted code.
+Pass `--validate-nextest` to `affected` or path-based `explain` to check emitted module filters with `cargo nextest list` and widen filters that fail or match no tests:
 
 ```bash
 cargo litmus affected --merge-base origin/main --validate-nextest --format json
 ```
 
-Without validation, Litmus still emits conservative commands but does not execute Cargo builds or build scripts while selecting them.
+`cargo nextest list` compiles test targets and executes build scripts and proc macros; enable `--validate-nextest` only on trusted code. Without it, Litmus selects commands statically without running Cargo builds or build scripts.
 
 ## Development
 
@@ -176,24 +166,7 @@ cargo audit
 
 ### Scenario tests
 
-`tests/integration/scenarios.rs` covers selection accuracy end to end. Each scenario
-synthesizes a multi-workspace Cargo monorepo in a temporary Git repository, builds a
-base index, commits a change, and runs the real `cargo-litmus affected` binary against
-it; the harness in `tests/integration/support/` provides the monorepo builders and
-scripts `cargo-ferris-wheel` deterministically, so the suite needs no installed
-ferris-wheel. The harness is split by concern: `monorepo.rs` (synthesis DSL and git
-plumbing), `ferris.rs` (shim and payload model), `report.rs` (test-side mirror of the
-JSON contract), `expectations.rs` (two-sided expectations and diagnostics),
-`scenario.rs` (the `check*` drivers), and `env.rs` (`PATH`/binary resolution).
-
-`tests/integration/main.rs` is the only integration-test root: Cargo compiles every
-top-level file in `tests/` into its own executable, so the suites and the harness live
-under one root to keep the harness compiled once and its dead-code analysis global.
-
-Scenario expectations are two-sided: `required` packages fail the run when they are
-missing (a false negative) and `allowed` packages fail the run when they are exceeded
-(over-selection past the scenario's declared conservative allowance). Add a scenario
-whenever a change class can widen or narrow selection.
+`tests/integration/scenarios.rs` tests end-to-end selection accuracy against synthesized multi-workspace Git monorepos and a deterministic `cargo-ferris-wheel` shim (no installed `cargo-ferris-wheel` required). Each scenario declares two-sided package expectations: missing a `required` package fails as a false negative, and selecting beyond `allowed` packages fails as unintended widening. Add a scenario whenever a change class can narrow or widen selection.
 
 ## License
 
