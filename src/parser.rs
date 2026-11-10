@@ -100,17 +100,18 @@ impl Collector<'_> {
             } else {
                 let (target_paths, explicit_path) = self.resolve_module_paths(item_mod);
                 if !target_paths.is_empty() {
+                    if explicit_path {
+                        self.source_dependencies
+                            .extend(target_paths.iter().map(|target_path| SourceDependencyNode {
+                                source_path: self.repo_relative_path.to_string(),
+                                target_path: target_path.clone(),
+                                kind: SourceDependencyKind::PathModule,
+                            }));
+                    }
                     self.module_declarations.push(ModuleDeclaration {
                         from_item_id: item_id,
-                        target_paths: target_paths.clone(),
+                        target_paths,
                     });
-                    if explicit_path {
-                        self.source_dependencies.push(SourceDependencyNode {
-                            source_path: self.repo_relative_path.to_string(),
-                            target_path: target_paths[0].clone(),
-                            kind: SourceDependencyKind::PathModule,
-                        });
-                    }
                 }
             }
         } else if let syn::Item::Impl(item_impl) = item {
@@ -250,20 +251,34 @@ impl Collector<'_> {
         let Some(parent) = self.file_parent else {
             return (Vec::new(), false);
         };
-        if let Some(explicit) = path_attribute(&item_mod.attrs) {
-            let target = normalize_lexical_path(&parent.join(explicit))
-                .and_then(|target| path_to_repo_string(&target));
-            return (target.into_iter().collect(), true);
+        let mut explicit_paths = Vec::new();
+        let mut unconditional_path = false;
+        for attr in &item_mod.attrs {
+            if attr.path().is_ident("path") {
+                unconditional_path = true;
+            }
+            collect_path_attributes(&attr.meta, &mut explicit_paths);
         }
-        let module_name = item_mod.ident.to_string();
-        let paths = [
-            parent.join(format!("{module_name}.rs")),
-            parent.join(module_name).join("mod.rs"),
-        ]
-        .iter()
-        .filter_map(|path| path_to_repo_string(path))
-        .collect::<Vec<_>>();
-        (paths, false)
+        let explicit_path = !explicit_paths.is_empty();
+        let mut paths = explicit_paths
+            .into_iter()
+            .filter_map(|explicit| normalize_lexical_path(&parent.join(explicit)))
+            .filter_map(|target| path_to_repo_string(&target))
+            .collect::<Vec<_>>();
+        // Without evaluating cfg predicates, every conditional path and the
+        // ordinary module locations remain possible compilation inputs.
+        if !unconditional_path {
+            let module_name = item_mod.ident.to_string();
+            paths.extend(
+                [
+                    parent.join(format!("{module_name}.rs")),
+                    parent.join(module_name).join("mod.rs"),
+                ]
+                .iter()
+                .filter_map(|path| path_to_repo_string(path)),
+            );
+        }
+        (paths, explicit_path)
     }
 }
 
@@ -307,22 +322,26 @@ impl<'ast> Visit<'ast> for IncludeCollector<'_> {
     }
 }
 
-fn path_attribute(attrs: &[syn::Attribute]) -> Option<String> {
-    attrs.iter().find_map(|attr| {
-        if !attr.path().is_ident("path") {
-            return None;
+fn collect_path_attributes(meta: &syn::Meta, paths: &mut Vec<String>) {
+    if meta.path().is_ident("path") {
+        if let syn::Meta::NameValue(value) = meta
+            && let syn::Expr::Lit(expression) = &value.value
+            && let syn::Lit::Str(path) = &expression.lit
+        {
+            paths.push(path.value());
         }
-        let syn::Meta::NameValue(value) = &attr.meta else {
-            return None;
-        };
-        let syn::Expr::Lit(expression) = &value.value else {
-            return None;
-        };
-        let syn::Lit::Str(path) = &expression.lit else {
-            return None;
-        };
-        Some(path.value())
-    })
+    } else if meta.path().is_ident("cfg_attr")
+        && let syn::Meta::List(list) = meta
+        && let Ok(arguments) = list.parse_args_with(
+            syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+        )
+    {
+        // The first argument is a predicate, not an attribute. Nested
+        // cfg_attr attributes can each contribute another possible path.
+        for attribute in arguments.iter().skip(1) {
+            collect_path_attributes(attribute, paths);
+        }
+    }
 }
 
 fn normalize_lexical_path(path: &Path) -> Option<PathBuf> {
@@ -653,6 +672,53 @@ mod tests {
             parsed.source_dependencies[0].kind,
             SourceDependencyKind::PathModule
         );
+    }
+
+    #[test]
+    fn records_conditional_path_alternatives_and_default_modules() {
+        let parsed = parse_rust_file(
+            "src/lib.rs",
+            &file_node(),
+            r#"
+#[cfg_attr(unix, path = "platform/unix.rs")]
+#[cfg_attr(not(unix), cfg_attr(feature = "portable", path = "platform/portable.rs"))]
+mod platform;
+"#,
+        )
+        .unwrap();
+
+        let targets = &parsed.module_declarations[0].target_paths;
+        assert_eq!(
+            targets,
+            &[
+                "src/platform/unix.rs",
+                "src/platform/portable.rs",
+                "src/platform.rs",
+                "src/platform/mod.rs",
+            ]
+        );
+        assert_eq!(parsed.source_dependencies.len(), targets.len());
+        for dependency in &parsed.source_dependencies {
+            assert_eq!(dependency.source_path, "src/lib.rs");
+            assert_eq!(dependency.kind, SourceDependencyKind::PathModule);
+            assert!(targets.contains(&dependency.target_path));
+        }
+    }
+
+    #[test]
+    fn conditional_outside_path_preserves_default_module_fallback() {
+        let parsed = parse_rust_file(
+            "src/lib.rs",
+            &file_node(),
+            "#[cfg_attr(unix, path = \"../../external.rs\")]\nmod platform;\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            parsed.module_declarations[0].target_paths,
+            vec!["src/platform.rs", "src/platform/mod.rs"]
+        );
+        assert_eq!(parsed.source_dependencies.len(), 2);
     }
 
     #[test]

@@ -87,16 +87,30 @@ cargo litmus affected \
 
 Cache metadata records the repository root and source/Cargo fingerprints. Missing, unreadable, or incompatible caches fall back to a conservative rebuild.
 
+Warm analysis reuses the loaded index without reconstructing its item graph when
+the supplied changes and repository fingerprints require no update. Adding or
+removing Rust sources refreshes Cargo metadata to discover automatic targets.
+
+Index format version 10 rebuilds older caches to include conditional module-path
+dependencies; existing base caches should be regenerated for structural comparisons.
+
 ## How inputs select tests
 
 Litmus classifies each changed path in precedence order:
 
 1. **Configured inputs**: `.cargo-litmus.toml` rules select named workspaces, packages and reverse dependents, or explicitly ignore paths.
 2. **Cargo inputs**: `.cargo/config.toml` (`.cargo/config`) and `rust-toolchain.toml` (`rust-toolchain`) resolve up the directory tree and widen to every workspace. `Cargo.toml`, `Cargo.lock`, and `build.rs` select their owning package and reverse dependents, or widen to the owning workspace when outside any package.
-3. **Indexed and embedded sources**: Tracked `.rs` files map to their owning package and reverse dependents. Files referenced by `include!`, `include_str!`, `include_bytes!`, or `#[path]` map to the packages that embed them and their reverse dependents.
+3. **Indexed and embedded sources**: Tracked `.rs` files map to their owning package and reverse dependents. Files referenced by `include!`, `include_str!`, `include_bytes!`, or `#[path]` map to the packages that embed them and their reverse dependents. Conditional `#[cfg_attr(..., path = "...")]` modules include every path alternative, including nested attributes and the default module location, without assuming a particular platform or feature set.
 4. **Generated paths** (`target/**`, `**/target/**`, `**/out/**`): Have no static source relationship and widen conservatively.
 5. **Built-in inert paths** (outside package roots, when `default-inert-paths = true`): Select nothing and are omitted from `cargo-ferris-wheel` queries, which would otherwise widen on unmapped files. Built-in inert classification stops at package roots: an unconfigured file beneath a package root still selects that package's closure because package code or tests can read files under `CARGO_MANIFEST_DIR` at runtime.
 6. **Unmapped files**: Select the owning package closure when beneath a package root, widen to the workspace when inside a workspace outside its packages, or widen to all workspaces when outside every workspace.
+
+Package-local narrowing requires every changed path to qualify. A manifest or
+binary-entrypoint change cannot hide a simultaneous library change: dependent
+tests remain selected. Lockfiles are known Cargo inputs, but never justify
+package-local narrowing.
+Production code stays production regardless of layout: `src/tests/`, a custom
+`tests.rs` library, or a `tests/` directory containing a production target.
 
 Built-in inert classes:
 

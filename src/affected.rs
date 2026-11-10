@@ -1152,14 +1152,17 @@ fn reverse_dependency_chains(
         .iter()
         .map(|package| (package.id.as_str(), package.name.as_str()))
         .collect::<BTreeMap<_, _>>();
+    let closures = direct_ids
+        .iter()
+        .map(|direct| reverse_package_closure(metadata, direct))
+        .collect::<Vec<_>>();
     let mut chains = metadata
         .package_dependencies
         .iter()
         .filter(|dependency| {
-            direct_ids.iter().any(|direct| {
-                reverse_package_closure(metadata, direct).contains(&dependency.package_id)
-                    && reverse_package_closure(metadata, direct)
-                        .contains(&dependency.depends_on_package_id)
+            closures.iter().any(|closure| {
+                closure.contains(&dependency.package_id)
+                    && closure.contains(&dependency.depends_on_package_id)
             })
         })
         .map(|dependency| PackageDependencyChain {
@@ -1751,10 +1754,6 @@ fn select_test_crates_with_configured_inputs(
         .iter()
         .map(|path| (*path).to_string())
         .collect::<Vec<_>>();
-    let bin_entrypoint_packages = known_changed_paths
-        .iter()
-        .filter_map(|path| bin_entrypoint_package(metadata, path))
-        .collect::<BTreeSet<_>>();
     let changed_packages = known_changed_paths
         .iter()
         .filter_map(|path| package_for_path(metadata, path))
@@ -1767,12 +1766,6 @@ fn select_test_crates_with_configured_inputs(
         .map(|package| package.id.clone())
         .collect::<BTreeSet<_>>();
     let changed_production_packages = changed_production_package_ids(metadata, diff);
-    let package_metadata_or_build_packages = known_changed_paths
-        .iter()
-        .filter(|path| is_package_metadata_or_build_file(metadata, path))
-        .filter_map(|path| package_for_path(metadata, path))
-        .map(|package| package.id.clone())
-        .collect::<BTreeSet<_>>();
     if has_configured_inputs {
         return TestSelection::from_ferris(
             ferris,
@@ -1837,21 +1830,32 @@ fn select_test_crates_with_configured_inputs(
     }
 
     if !changed_packages.is_empty()
-        && changed_packages == package_metadata_or_build_packages
+        && !included_source_changes
+        && known_changed_paths.iter().all(|path| {
+            // Known Cargo inputs are not necessarily package-local inputs.
+            is_package_metadata_or_build_file(metadata, path)
+                && !matches!(cargo_input_kind(path), Some((InputKind::CargoLock, _)))
+        })
         && !package_build_inputs_propagate(metadata, changed_file_inputs)
     {
         return package_local_test_selection(
             metadata,
             ferris,
-            &package_metadata_or_build_packages,
+            &changed_packages,
             workspace_uncertainty,
             REASON_TEST_PACKAGE_METADATA,
             &known_changed_path_strings,
         );
     }
 
-    let selection_is_only_bin_entrypoints =
-        !changed_packages.is_empty() && changed_packages == bin_entrypoint_packages;
+    let selection_is_only_bin_entrypoints = !changed_packages.is_empty()
+        && !included_source_changes
+        && known_changed_paths.iter().all(|path| {
+            metadata
+                .targets
+                .iter()
+                .any(|target| target.is_bin() && target.src_path == *path)
+        });
     if !selection_is_only_bin_entrypoints {
         // Do not infer that production behavior is package-local from item visibility
         // or an unchanged Rust signature. Private code can be reached through
@@ -1867,6 +1871,10 @@ fn select_test_crates_with_configured_inputs(
         );
     }
 
+    let bin_entrypoint_packages = known_changed_paths
+        .iter()
+        .filter_map(|path| bin_entrypoint_package(metadata, path))
+        .collect::<BTreeSet<_>>();
     package_local_test_selection(
         metadata,
         ferris,
@@ -2502,8 +2510,9 @@ fn module_filter(metadata: &IndexMetadata, path: &str, module_name: &str) -> Str
     let Some(package) = package_for_path(metadata, path) else {
         return module_name.to_string();
     };
-    let src_prefix = format!("{}/src/", package.root_path);
-    let Some(module_path) = path.strip_prefix(&src_prefix) else {
+    let Some(module_path) =
+        package_relative_path(package, path).and_then(|path| path.strip_prefix("src/"))
+    else {
         return module_name.to_string();
     };
     let module_path = module_path.trim_end_matches(".rs");
@@ -2781,34 +2790,61 @@ fn package_for_path<'a>(metadata: &'a IndexMetadata, path: &str) -> Option<&'a P
         .max_by_key(|package| package.root_path.len())
 }
 
+fn package_relative_path<'a>(package: &PackageNode, path: &'a str) -> Option<&'a str> {
+    let relative = path.strip_prefix(&package.root_path)?;
+    if package.root_path.is_empty() {
+        Some(relative)
+    } else {
+        relative.strip_prefix('/')
+    }
+}
+
 fn is_package_metadata_or_build_file(metadata: &IndexMetadata, path: &str) -> bool {
     package_for_path(metadata, path).is_some_and(|package| {
         path == package.manifest_path
-            || path == format!("{}/Cargo.lock", package.root_path)
-            || path == format!("{}/build.rs", package.root_path)
+            || matches!(
+                package_relative_path(package, path),
+                Some("Cargo.lock" | "build.rs")
+            )
     })
 }
 
 fn is_package_src_path(package: &PackageNode, path: &str) -> bool {
-    path == format!("{}/src.rs", package.root_path)
-        || path.starts_with(&format!("{}/src/", package.root_path))
+    package_relative_path(package, path)
+        .is_some_and(|path| path == "src.rs" || path.starts_with("src/"))
 }
 
 /// Sources of targets that are not linked into the library other packages
 /// consume: integration tests, benches, and examples. Changes there cannot
 /// change a dependent's compiled artifact.
 fn is_test_source_path(metadata: &IndexMetadata, path: &str) -> bool {
-    metadata.targets.iter().any(|target| {
-        target.src_path == path
-            && target
-                .kind
-                .iter()
-                .any(|kind| matches!(kind.as_str(), "test" | "bench" | "example"))
-    }) || package_for_path(metadata, path).is_some_and(|package| {
-        path == format!("{}/tests.rs", package.root_path)
-            || path.starts_with(&format!("{}/tests/", package.root_path))
-            || path.contains(&format!("{}/tests/", package.root_path))
-    })
+    let package = package_for_path(metadata, path);
+    let relative_path = package.and_then(|package| package_relative_path(package, path));
+    let in_tests_directory = relative_path.is_some_and(|path| path.starts_with("tests/"));
+    let mut is_test_target_source = false;
+    for target in &metadata.targets {
+        let is_test_only = target
+            .kind
+            .iter()
+            .any(|kind| matches!(kind.as_str(), "test" | "bench" | "example"));
+        if is_test_only {
+            is_test_target_source |= target.src_path == path;
+            continue;
+        }
+        // A production target can load ordinary child modules from tests/.
+        // Without source ownership proof, keep the whole directory conservative.
+        if target.src_path == path
+            || (in_tests_directory
+                && package.is_some_and(|package| {
+                    target.package_id == package.id
+                        && package_relative_path(package, &target.src_path)
+                            .is_some_and(|path| path.starts_with("tests/"))
+                }))
+        {
+            return false;
+        }
+    }
+    is_test_target_source || relative_path == Some("tests.rs") || in_tests_directory
 }
 
 fn test_target_for_path<'a>(
@@ -3175,6 +3211,70 @@ mod tests {
         metadata
     }
 
+    #[test]
+    fn conditional_path_modules_map_changes_to_every_consuming_package() {
+        let mut metadata = package_metadata("api-lib/src/lib.rs");
+        let parsed = crate::parser::parse_rust_file(
+            "api-lib/src/lib.rs",
+            &metadata.files[0],
+            r#"
+#[cfg_attr(unix, path = "../../api-bin/tests/unix.rs")]
+#[cfg_attr(not(unix), cfg_attr(feature = "portable", path = "../../api-bin/tests/portable.rs"))]
+mod platform;
+"#,
+        )
+        .unwrap();
+        metadata.source_dependencies = parsed.source_dependencies;
+
+        for path in [
+            "api-bin/tests/unix.rs",
+            "api-bin/tests/portable.rs",
+            "api-lib/src/platform.rs",
+            "api-lib/src/platform/mod.rs",
+        ] {
+            push_file(&mut metadata, path);
+            let mut ferris = FerrisAffectedReport::default();
+            let explanations = explain_inputs(
+                Path::new("."),
+                &metadata,
+                &mut ferris,
+                &[ChangedFileInput {
+                    path: path.to_string(),
+                    ranges: Vec::new(),
+                }],
+                &[],
+                &LitmusConfig::default(),
+            );
+
+            assert_eq!(explanations.len(), 1);
+            let explanation = &explanations[0];
+            assert_eq!(explanation.kind, InputKind::PathModule, "{path}");
+            assert!(!explanation.failed_wide, "{path}");
+            assert!(
+                explanation
+                    .direct_packages
+                    .iter()
+                    .any(|name| name == "api-lib"),
+                "{path} must select its conditional module consumer"
+            );
+            if path.starts_with("api-bin/") {
+                assert!(
+                    explanation
+                        .direct_packages
+                        .iter()
+                        .any(|name| name == "api-bin")
+                );
+            }
+            let selected = ferris
+                .affected_crates
+                .iter()
+                .map(|krate| krate.name.as_str())
+                .collect::<BTreeSet<_>>();
+            assert_eq!(selected, BTreeSet::from(["api-bin", "api-lib"]), "{path}");
+            assert!(is_included_source(&metadata, path), "{path}");
+        }
+    }
+
     fn push_test_module(
         metadata: &mut IndexMetadata,
         name: &str,
@@ -3480,21 +3580,29 @@ mod tests {
     }
 
     #[test]
-    fn package_lockfile_change_selects_owning_package_tests() {
+    fn package_lockfile_change_keeps_dependency_selection() {
         let metadata = package_metadata("api-lib/src/lib.rs");
-        let diff = diff_current_index(&metadata, &["api-lib/Cargo.lock".to_string()]);
-        let selection = select_test_crates(
-            &metadata,
-            &ferris_report_for_api_lib_test(),
-            &diff,
-            &BTreeMap::<String, Vec<String>>::new(),
-            &[],
-        );
-
-        assert!(diff.unknown_files.is_empty());
-        assert_eq!(selection.reason, REASON_TEST_PACKAGE_METADATA);
-        assert_eq!(selection.affected_test_crates.len(), 1);
-        assert_eq!(selection.affected_test_crates[0].name, "api-lib");
+        let paths = ["api-lib/Cargo.lock".to_string()];
+        for diff in [
+            diff_current_index(&metadata, &paths),
+            diff_indexes(&metadata, &metadata, &paths),
+        ] {
+            assert!(diff.unknown_files.is_empty());
+            let selection = select_test_crates(
+                &metadata,
+                &ferris_report_for_api_lib_test(),
+                &diff,
+                &BTreeMap::<String, Vec<String>>::new(),
+                &[],
+            );
+            let selected = selection
+                .affected_test_crates
+                .iter()
+                .map(|krate| krate.name.as_str())
+                .collect::<BTreeSet<_>>();
+            assert_eq!(selected, BTreeSet::from(["api-lib", "api-bin"]));
+            assert!(!selection.failed_wide);
+        }
     }
 
     #[test]
