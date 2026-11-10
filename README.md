@@ -14,6 +14,9 @@ Select the Rust tests affected by a Git change and emit focused `cargo nextest` 
 
 [`cargo-nextest`](https://nexte.st/) is optional unless you execute the emitted commands or pass `--validate-nextest`. The minimum supported Rust version is 1.88.0.
 
+Use 0.2.3 or newer for prebuilt binaries. The immutable 0.2.2 release archives lack
+execute permissions; 0.2.3 corrects the packaging without changing binary behavior.
+
 ```bash
 # Prebuilt binaries via cargo-binstall.
 cargo binstall cargo-litmus cargo-ferris-wheel cargo-nextest

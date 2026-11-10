@@ -110,6 +110,7 @@ jobs:
 
               # The binary is named cargo-litmus
               if [ -f "cargo-litmus" ]; then
+                chmod +x cargo-litmus
                 # Create a tar.gz archive with the binary using cargo-binstall naming
                 tar -czf "../cargo-litmus-${VERSION}-${rust_target}.tar.gz" cargo-litmus
                 echo "Created cargo-litmus-${VERSION}-${rust_target}.tar.gz"
