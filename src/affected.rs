@@ -1831,9 +1831,11 @@ fn select_test_crates_with_configured_inputs(
 
     if !changed_packages.is_empty()
         && !included_source_changes
-        && known_changed_paths
-            .iter()
-            .all(|path| is_package_metadata_or_build_file(metadata, path))
+        && known_changed_paths.iter().all(|path| {
+            // Known Cargo inputs are not necessarily package-local inputs.
+            is_package_metadata_or_build_file(metadata, path)
+                && !matches!(cargo_input_kind(path), Some((InputKind::CargoLock, _)))
+        })
         && !package_build_inputs_propagate(metadata, changed_file_inputs)
     {
         return package_local_test_selection(
@@ -2799,7 +2801,11 @@ fn package_relative_path<'a>(package: &PackageNode, path: &'a str) -> Option<&'a
 
 fn is_package_metadata_or_build_file(metadata: &IndexMetadata, path: &str) -> bool {
     package_for_path(metadata, path).is_some_and(|package| {
-        path == package.manifest_path || package_relative_path(package, path) == Some("build.rs")
+        path == package.manifest_path
+            || matches!(
+                package_relative_path(package, path),
+                Some("Cargo.lock" | "build.rs")
+            )
     })
 }
 
@@ -3574,21 +3580,29 @@ mod platform;
     }
 
     #[test]
-    fn package_lockfile_change_selects_owning_package_tests() {
+    fn package_lockfile_change_keeps_dependency_selection() {
         let metadata = package_metadata("api-lib/src/lib.rs");
-        let diff = diff_current_index(&metadata, &["api-lib/Cargo.lock".to_string()]);
-        let selection = select_test_crates(
-            &metadata,
-            &ferris_report_for_api_lib_test(),
-            &diff,
-            &BTreeMap::<String, Vec<String>>::new(),
-            &[],
-        );
-
-        assert!(diff.unknown_files.is_empty());
-        assert_eq!(selection.reason, REASON_TEST_PACKAGE_METADATA);
-        assert_eq!(selection.affected_test_crates.len(), 1);
-        assert_eq!(selection.affected_test_crates[0].name, "api-lib");
+        let paths = ["api-lib/Cargo.lock".to_string()];
+        for diff in [
+            diff_current_index(&metadata, &paths),
+            diff_indexes(&metadata, &metadata, &paths),
+        ] {
+            assert!(diff.unknown_files.is_empty());
+            let selection = select_test_crates(
+                &metadata,
+                &ferris_report_for_api_lib_test(),
+                &diff,
+                &BTreeMap::<String, Vec<String>>::new(),
+                &[],
+            );
+            let selected = selection
+                .affected_test_crates
+                .iter()
+                .map(|krate| krate.name.as_str())
+                .collect::<BTreeSet<_>>();
+            assert_eq!(selected, BTreeSet::from(["api-lib", "api-bin"]));
+            assert!(!selection.failed_wide);
+        }
     }
 
     #[test]

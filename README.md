@@ -107,7 +107,8 @@ Litmus classifies each changed path in precedence order:
 
 Package-local narrowing requires every changed path to qualify. A manifest or
 binary-entrypoint change cannot hide a simultaneous library change: dependent
-tests remain selected. Lockfile changes retain the affected dependency closure.
+tests remain selected. Lockfiles are known Cargo inputs, but never justify
+package-local narrowing.
 Production code stays production regardless of layout: `src/tests/`, a custom
 `tests.rs` library, or a `tests/` directory containing a production target.
 
