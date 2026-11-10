@@ -88,7 +88,8 @@ cargo litmus affected \
 Cache metadata records the repository root and source/Cargo fingerprints. Missing, unreadable, or incompatible caches fall back to a conservative rebuild.
 
 Warm analysis reuses the loaded index without reconstructing its item graph when
-the supplied changes and repository fingerprints require no update.
+the supplied changes and repository fingerprints require no update. Adding or
+removing Rust sources refreshes Cargo metadata to discover automatic targets.
 
 Index format version 10 rebuilds older caches to include conditional module-path
 dependencies; existing base caches should be regenerated for structural comparisons.
@@ -106,8 +107,9 @@ Litmus classifies each changed path in precedence order:
 
 Package-local narrowing requires every changed path to qualify. A manifest or
 binary-entrypoint change cannot hide a simultaneous library change: dependent
-tests remain selected. A production module beneath `src/tests/` is not assumed
-test-only, including in crates at the repository root.
+tests remain selected. Lockfile changes retain the affected dependency closure.
+Production code stays production regardless of layout: `src/tests/`, a custom
+`tests.rs` library, or a `tests/` directory containing a production target.
 
 Built-in inert classes:
 

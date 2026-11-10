@@ -182,36 +182,18 @@ pub fn build_or_update_index(
         let path = &source_file.repo_relative_path;
         let previous_file = previous_by_path.get(path).copied();
         if let Some(previous_file) = previous_file {
-            if changed_paths.contains(path) {
-                let current_hash = source_file_hash(source_file)?;
-                if previous_file.hash == current_hash {
-                    files_reused += 1;
-                    reused_paths.push(path.as_str());
-                } else {
-                    let parsed = parse_source_file(source_file)?;
-                    files_reparsed += 1;
-                    parsed_files.push(parsed);
-                }
-            } else if unchanged_file_list && !portable_cache {
+            let can_trust_previous =
+                !changed_paths.contains(path) && unchanged_file_list && !portable_cache;
+            if can_trust_previous || previous_file.hash == source_file_hash(source_file)? {
                 files_reused += 1;
                 reused_paths.push(path.as_str());
-            } else {
-                let current_hash = source_file_hash(source_file)?;
-                if previous_file.hash == current_hash {
-                    files_reused += 1;
-                    reused_paths.push(path.as_str());
-                } else {
-                    let parsed = parse_source_file(source_file)?;
-                    files_reparsed += 1;
-                    parsed_files.push(parsed);
-                }
+                continue;
             }
         } else {
-            let parsed = parse_source_file(source_file)?;
             files_added += 1;
-            files_reparsed += 1;
-            parsed_files.push(parsed);
         }
+        parsed_files.push(parse_source_file(source_file)?);
+        files_reparsed += 1;
     }
 
     for previous_file in &previous.files {
@@ -261,11 +243,15 @@ pub fn build_or_update_index(
         );
     }
 
-    let mut metadata = metadata_from_parts(
-        &discovery.repo_root,
-        parsed_files,
-        cached_cargo_graph(&previous),
-    )?;
+    // Cargo discovers targets from source layout as well as manifests.
+    let cargo_graph = if unchanged_file_list {
+        cached_cargo_graph(&previous)
+    } else {
+        let mut graph = build_cargo_graph(&discovery.repo_root)?;
+        graph.metadata_hash = cargo_graph_input_hash(&discovery.repo_root)?;
+        graph
+    };
+    let mut metadata = metadata_from_parts(&discovery.repo_root, parsed_files, cargo_graph)?;
     rebuild_module_edges(&mut metadata);
     let metadata = metadata.sorted();
 

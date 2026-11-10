@@ -1754,10 +1754,6 @@ fn select_test_crates_with_configured_inputs(
         .iter()
         .map(|path| (*path).to_string())
         .collect::<Vec<_>>();
-    let bin_entrypoint_packages = known_changed_paths
-        .iter()
-        .filter_map(|path| bin_entrypoint_package(metadata, path))
-        .collect::<BTreeSet<_>>();
     let changed_packages = known_changed_paths
         .iter()
         .filter_map(|path| package_for_path(metadata, path))
@@ -1770,12 +1766,6 @@ fn select_test_crates_with_configured_inputs(
         .map(|package| package.id.clone())
         .collect::<BTreeSet<_>>();
     let changed_production_packages = changed_production_package_ids(metadata, diff);
-    let package_metadata_or_build_packages = known_changed_paths
-        .iter()
-        .filter(|path| is_package_metadata_or_build_file(metadata, path))
-        .filter_map(|path| package_for_path(metadata, path))
-        .map(|package| package.id.clone())
-        .collect::<BTreeSet<_>>();
     if has_configured_inputs {
         return TestSelection::from_ferris(
             ferris,
@@ -1849,7 +1839,7 @@ fn select_test_crates_with_configured_inputs(
         return package_local_test_selection(
             metadata,
             ferris,
-            &package_metadata_or_build_packages,
+            &changed_packages,
             workspace_uncertainty,
             REASON_TEST_PACKAGE_METADATA,
             &known_changed_path_strings,
@@ -1879,6 +1869,10 @@ fn select_test_crates_with_configured_inputs(
         );
     }
 
+    let bin_entrypoint_packages = known_changed_paths
+        .iter()
+        .filter_map(|path| bin_entrypoint_package(metadata, path))
+        .collect::<BTreeSet<_>>();
     package_local_test_selection(
         metadata,
         ferris,
@@ -2805,11 +2799,7 @@ fn package_relative_path<'a>(package: &PackageNode, path: &'a str) -> Option<&'a
 
 fn is_package_metadata_or_build_file(metadata: &IndexMetadata, path: &str) -> bool {
     package_for_path(metadata, path).is_some_and(|package| {
-        path == package.manifest_path
-            || matches!(
-                package_relative_path(package, path),
-                Some("Cargo.lock" | "build.rs")
-            )
+        path == package.manifest_path || package_relative_path(package, path) == Some("build.rs")
     })
 }
 
@@ -2822,15 +2812,33 @@ fn is_package_src_path(package: &PackageNode, path: &str) -> bool {
 /// consume: integration tests, benches, and examples. Changes there cannot
 /// change a dependent's compiled artifact.
 fn is_test_source_path(metadata: &IndexMetadata, path: &str) -> bool {
-    metadata.targets.iter().any(|target| {
-        target.src_path == path
-            && target
-                .kind
-                .iter()
-                .any(|kind| matches!(kind.as_str(), "test" | "bench" | "example"))
-    }) || package_for_path(metadata, path)
-        .and_then(|package| package_relative_path(package, path))
-        .is_some_and(|path| path == "tests.rs" || path.starts_with("tests/"))
+    let package = package_for_path(metadata, path);
+    let relative_path = package.and_then(|package| package_relative_path(package, path));
+    let in_tests_directory = relative_path.is_some_and(|path| path.starts_with("tests/"));
+    let mut is_test_target_source = false;
+    for target in &metadata.targets {
+        let is_test_only = target
+            .kind
+            .iter()
+            .any(|kind| matches!(kind.as_str(), "test" | "bench" | "example"));
+        if is_test_only {
+            is_test_target_source |= target.src_path == path;
+            continue;
+        }
+        // A production target can load ordinary child modules from tests/.
+        // Without source ownership proof, keep the whole directory conservative.
+        if target.src_path == path
+            || (in_tests_directory
+                && package.is_some_and(|package| {
+                    target.package_id == package.id
+                        && package_relative_path(package, &target.src_path)
+                            .is_some_and(|path| path.starts_with("tests/"))
+                }))
+        {
+            return false;
+        }
+    }
+    is_test_target_source || relative_path == Some("tests.rs") || in_tests_directory
 }
 
 fn test_target_for_path<'a>(

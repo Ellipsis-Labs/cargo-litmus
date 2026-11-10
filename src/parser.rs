@@ -100,19 +100,18 @@ impl Collector<'_> {
             } else {
                 let (target_paths, explicit_path) = self.resolve_module_paths(item_mod);
                 if !target_paths.is_empty() {
+                    if explicit_path {
+                        self.source_dependencies
+                            .extend(target_paths.iter().map(|target_path| SourceDependencyNode {
+                                source_path: self.repo_relative_path.to_string(),
+                                target_path: target_path.clone(),
+                                kind: SourceDependencyKind::PathModule,
+                            }));
+                    }
                     self.module_declarations.push(ModuleDeclaration {
                         from_item_id: item_id,
-                        target_paths: target_paths.clone(),
+                        target_paths,
                     });
-                    if explicit_path {
-                        for target_path in target_paths {
-                            self.source_dependencies.push(SourceDependencyNode {
-                                source_path: self.repo_relative_path.to_string(),
-                                target_path,
-                                kind: SourceDependencyKind::PathModule,
-                            });
-                        }
-                    }
                 }
             }
         } else if let syn::Item::Impl(item_impl) = item {

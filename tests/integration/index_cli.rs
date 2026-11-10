@@ -1,7 +1,10 @@
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use cargo_litmus::affected::{AffectedOptions, InputKind, NextestValidation, compute_affected};
+use cargo_litmus::affected::{
+    AffectedOptions, AffectedReport, InputKind, NextestValidation, compute_affected,
+};
 use cargo_litmus::changed_files::ChangedFileInput;
 use cargo_litmus::explain::ExplainReport;
 use cargo_litmus::ferris::{AffectedCrate, AffectedWorkspace, FerrisAffectedReport, FerrisRunner};
@@ -752,6 +755,67 @@ fn incremental_index_refreshes_cargo_metadata_when_manifest_changes() {
 }
 
 #[test]
+fn incremental_index_refreshes_automatically_discovered_targets() {
+    let repo = tracked_repo(&[
+        (
+            "Cargo.toml",
+            "[package]\nname = \"api\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        ),
+        ("src/lib.rs", "pub fn api() {}\n"),
+    ]);
+    let options = IndexOptions {
+        root: repo.path().to_path_buf(),
+        cache_path: Some(repo.path().join("target/current.rkyv")),
+    };
+    build_index(&options).unwrap();
+    let added_sources = [
+        ("src/bin/tool.rs", "fn main() {}\n"),
+        ("tests/integration.rs", "#[test]\nfn works() {}\n"),
+    ];
+    let git = Repository::open(repo.path()).unwrap();
+    let mut index = git.index().unwrap();
+    for (path, contents) in added_sources {
+        let full_path = repo.path().join(path);
+        fs::create_dir_all(full_path.parent().unwrap()).unwrap();
+        fs::write(full_path, contents).unwrap();
+        index.add_path(Path::new(path)).unwrap();
+    }
+    index.write().unwrap();
+    let changes = added_sources
+        .iter()
+        .map(|(path, _)| ChangedFileInput::path_only(*path))
+        .collect::<Vec<_>>();
+    let (metadata, summary) = build_or_update_index(&options, &changes).unwrap();
+    assert_eq!(summary.index_mode, IndexMode::IncrementalUpdate);
+    assert_eq!(summary.files_reused, 1);
+    let targets = metadata
+        .targets
+        .iter()
+        .map(|target| (target.src_path.as_str(), target.kind[0].as_str()))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        targets,
+        BTreeSet::from([
+            ("src/lib.rs", "lib"),
+            ("src/bin/tool.rs", "bin"),
+            ("tests/integration.rs", "test"),
+        ]),
+    );
+
+    for (path, _) in added_sources {
+        fs::remove_file(repo.path().join(path)).unwrap();
+    }
+    let (metadata, summary) = build_or_update_index(&options, &changes).unwrap();
+    assert_eq!(summary.index_mode, IndexMode::IncrementalUpdate);
+    let targets = metadata
+        .targets
+        .iter()
+        .map(|target| target.src_path.as_str())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(targets, BTreeSet::from(["src/lib.rs"]));
+}
+
+#[test]
 fn incremental_index_trusts_unchanged_file_list_for_unlisted_files() {
     let repo = tracked_repo(&[
         ("src/lib.rs", "mod foo;\npub fn root() {}\n"),
@@ -1292,14 +1356,20 @@ impl FerrisRunner for RootPathFerrisRunner {
 }
 
 fn root_path_fixture(package_root: &str) -> (TempDir, RootPathFerrisRunner) {
-    let files = [
-        (
-            "Cargo.toml",
-            concat!(
-                "[package]\nname = \"root-library\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
-                "[workspace]\nmembers = [\"downstream\"]\nresolver = \"2\"\n",
-            ),
-        ),
+    root_path_fixture_with_library(package_root, "src/lib.rs")
+}
+
+fn root_path_fixture_with_library(
+    package_root: &str,
+    library_path: &str,
+) -> (TempDir, RootPathFerrisRunner) {
+    let manifest = format!(
+        "[package]\nname = \"root-library\"\nversion = \"0.1.0\"\nedition = \
+         \"2024\"\n[workspace]\nmembers = [\"downstream\"]\nresolver = \"2\"\n[lib]\npath = \
+         {library_path:?}\n",
+    );
+    let mut files = vec![
+        ("Cargo.toml", manifest.as_str()),
         ("src/lib.rs", "pub mod tests;\nmod feature;\n"),
         ("src/tests/mod.rs", "pub fn production() -> u32 { 1 }\n"),
         (
@@ -1324,6 +1394,19 @@ fn root_path_fixture(package_root: &str) -> (TempDir, RootPathFerrisRunner) {
              1); }\n",
         ),
     ];
+    let support_path = Path::new(library_path).parent().unwrap().join("support.rs");
+    if library_path != "src/lib.rs" {
+        files.extend([
+            (
+                library_path,
+                "mod support;\npub mod tests { pub use super::support::production; }\n",
+            ),
+            (
+                support_path.to_str().unwrap(),
+                "pub fn production() -> u32 { 1 }\n",
+            ),
+        ]);
+    }
     let files = files
         .into_iter()
         .map(|(path, contents)| {
@@ -1381,43 +1464,52 @@ fn root_path_fixture(package_root: &str) -> (TempDir, RootPathFerrisRunner) {
     (repo, runner)
 }
 
+fn root_path_affected(
+    repo: &TempDir,
+    runner: &RootPathFerrisRunner,
+    path: impl AsRef<Path>,
+) -> AffectedReport {
+    compute_affected(
+        &AffectedOptions {
+            root: repo.path().to_path_buf(),
+            files: vec![path.as_ref().to_str().unwrap().to_string()],
+            changed_files: Vec::new(),
+            base_cache: None,
+            current_cache: None,
+        },
+        runner,
+    )
+    .unwrap()
+}
+
+fn assert_root_path_selection(report: &AffectedReport, expected: &[&str]) {
+    assert!(!report.failed_wide);
+    assert!(!report.test_failed_wide);
+    let selected = report
+        .affected_test_crates
+        .iter()
+        .map(|krate| krate.name.as_str())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        selected,
+        expected.iter().copied().collect::<BTreeSet<_>>(),
+        "changed files: {:?}",
+        report.changed_files,
+    );
+}
+
 #[test]
 fn production_tests_directory_retains_dependent_tests_for_root_and_nested_packages() {
     for package_root in ["", "core"] {
         let (repo, runner) = root_path_fixture(package_root);
-        let path = if package_root.is_empty() {
-            "src/tests/mod.rs".to_string()
-        } else {
-            format!("{package_root}/src/tests/mod.rs")
-        };
+        let path = Path::new(package_root).join("src/tests/mod.rs");
         fs::write(
             repo.path().join(&path),
             "pub fn production() -> u32 { 2 }\n",
         )
         .unwrap();
-        let report = compute_affected(
-            &AffectedOptions {
-                root: repo.path().to_path_buf(),
-                files: vec![path],
-                changed_files: Vec::new(),
-                base_cache: None,
-                current_cache: None,
-            },
-            &runner,
-        )
-        .unwrap();
-
-        assert!(!report.failed_wide, "package root: {package_root:?}");
-        assert!(!report.test_failed_wide, "package root: {package_root:?}");
-        for package in ["root-library", "downstream"] {
-            assert!(
-                report
-                    .affected_test_crates
-                    .iter()
-                    .any(|krate| krate.name == package),
-                "missing {package} for package root {package_root:?}",
-            );
-        }
+        let report = root_path_affected(&repo, &runner, path);
+        assert_root_path_selection(&report, &["root-library", "downstream"]);
     }
 }
 
@@ -1442,10 +1534,7 @@ fn root_package_cfg_test_module_keeps_qualified_filter() {
     )
     .unwrap();
 
-    assert!(!report.failed_wide);
-    assert!(!report.test_failed_wide);
-    assert_eq!(report.affected_test_crates.len(), 1);
-    assert_eq!(report.affected_test_crates[0].name, "root-library");
+    assert_root_path_selection(&report, &["root-library"]);
     assert_eq!(report.nextest_commands.len(), 1);
     assert_eq!(
         report.nextest_commands[0].module_filter.as_deref(),
@@ -1457,26 +1546,46 @@ fn root_package_cfg_test_module_keeps_qualified_filter() {
 fn integration_test_helpers_stay_package_local_for_root_and_nested_packages() {
     for package_root in ["", "core"] {
         let (repo, runner) = root_path_fixture(package_root);
-        let path = if package_root.is_empty() {
-            "tests/helper/mod.rs".to_string()
-        } else {
-            format!("{package_root}/tests/helper/mod.rs")
-        };
-        let report = compute_affected(
-            &AffectedOptions {
-                root: repo.path().to_path_buf(),
-                files: vec![path],
-                changed_files: Vec::new(),
-                base_cache: None,
-                current_cache: None,
-            },
-            &runner,
-        )
-        .unwrap();
+        let path = Path::new(package_root).join("tests/helper/mod.rs");
+        let report = root_path_affected(&repo, &runner, path);
+        assert_root_path_selection(&report, &["root-library"]);
+    }
+}
 
-        assert!(!report.failed_wide, "package root: {package_root:?}");
-        assert!(!report.test_failed_wide, "package root: {package_root:?}");
-        assert_eq!(report.affected_test_crates.len(), 1);
-        assert_eq!(report.affected_test_crates[0].name, "root-library");
+#[test]
+fn custom_library_test_paths_retain_dependent_tests() {
+    for package_root in ["", "core"] {
+        for (library_path, changed_path) in [
+            ("tests.rs", "tests.rs"),
+            ("tests/lib.rs", "tests/lib.rs"),
+            ("tests/lib.rs", "tests/support.rs"),
+        ] {
+            let (repo, runner) = root_path_fixture_with_library(package_root, library_path);
+            let path = Path::new(package_root).join(changed_path);
+            let contents = if changed_path == library_path {
+                "pub mod tests { pub fn production() -> u32 { 2 } }\n"
+            } else {
+                "pub fn production() -> u32 { 2 }\n"
+            };
+            fs::write(repo.path().join(&path), contents).unwrap();
+            let report = root_path_affected(&repo, &runner, path);
+            assert_root_path_selection(&report, &["root-library", "downstream"]);
+        }
+    }
+}
+
+#[test]
+fn workspace_lockfile_retains_dependent_tests_for_root_and_nested_packages() {
+    for package_root in ["", "core"] {
+        let (repo, runner) = root_path_fixture(package_root);
+        let path = Path::new(package_root).join("Cargo.lock");
+        let lockfile = fs::read_to_string(repo.path().join(&path)).unwrap();
+        fs::write(repo.path().join(&path), format!("{lockfile}\n")).unwrap();
+        let git = Repository::open(repo.path()).unwrap();
+        let mut index = git.index().unwrap();
+        index.add_path(&path).unwrap();
+        index.write().unwrap();
+        let report = root_path_affected(&repo, &runner, path);
+        assert_root_path_selection(&report, &["root-library", "downstream"]);
     }
 }
