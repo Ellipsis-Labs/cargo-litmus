@@ -36,6 +36,8 @@
 //!         changed_files: changes.files,
 //!         base_cache: None,
 //!         current_cache: None,
+//!         base_revision: Some("HEAD".to_string()),
+//!         head_is_working_tree: true,
 //!     },
 //!     &CommandFerrisRunner,
 //! )?;
@@ -57,6 +59,7 @@ pub mod explain;
 pub mod ferris;
 pub mod indexer;
 pub mod inert;
+pub mod lockfile;
 pub mod model;
 pub mod nextest;
 pub mod parser;

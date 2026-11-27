@@ -394,9 +394,49 @@ fn workspace_lockfile_change_widens_only_its_own_workspace() {
             .require_command(CommandExpectation::new("sdk", CommandMode::WorkspaceWide))
             .forbid_global_fail_wide()
             .note(
-                "a workspace lockfile has no owning package; widening must stay in that workspace",
+                "the edited lockfile disagrees with its manifests, so cargo rewrites it and it \
+                 cannot be attributed; widening must stay in that workspace",
             ),
         Some(payload),
+    );
+}
+
+/// The lockfile records the new edge from `cli` to `core`; comparing it with
+/// the base lockfile attributes the change to `cli` alone instead of widening
+/// the workspace, and `core`'s other dependent stays unselected.
+#[test]
+fn workspace_lockfile_change_selects_only_members_whose_resolution_changed() {
+    let monorepo = Monorepo::new(vec![
+        ws("svc")
+            .lockfile()
+            .package(pkg("core"))
+            .package(pkg("api").dep("core"))
+            .package(pkg("cli")),
+    ]);
+    let manifest =
+        fs::read_to_string(monorepo.root().join("svc/cli/Cargo.toml")).expect("read manifest");
+    let lockfile =
+        fs::read_to_string(monorepo.root().join("svc/Cargo.lock")).expect("read lockfile");
+    let cli_entry = "name = \"cli\"\nversion = \"0.1.0\"\n";
+    assert!(lockfile.contains(&format!("{cli_entry}\n")), "{lockfile}");
+    let changed_lockfile = lockfile.replace(
+        cli_entry,
+        &format!("{cli_entry}dependencies = [\n \"core\",\n]\n"),
+    );
+    check(
+        "workspace_lockfile_change_selects_only_members_whose_resolution_changed",
+        monorepo,
+        &[
+            edit(
+                "svc/cli/Cargo.toml",
+                &format!("{manifest}\n[dependencies]\ncore = {{ path = \"../core\" }}\n"),
+            ),
+            edit("svc/Cargo.lock", &changed_lockfile),
+        ],
+        &Expect::exact(&[target("svc/cli")])
+            .require_command(CommandExpectation::new("svc", CommandMode::Package).package("cli"))
+            .forbid_global_fail_wide()
+            .note("only cli's locked dependency list changed"),
     );
 }
 

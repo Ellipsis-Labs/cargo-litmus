@@ -179,6 +179,32 @@ pub fn changed_file_inputs_from_revs(
     Ok(ChangeSet::revisions(root, base_rev, head_rev)?.files)
 }
 
+/// Read a UTF-8 file as committed at `revision`. `path` is relative to `root`.
+/// Returns `None` when the revision does not contain the file or the file is
+/// not valid UTF-8.
+pub fn file_at_revision(root: &Path, revision: &str, path: &str) -> Result<Option<String>> {
+    let repo = open_repository(root)?;
+    let workdir = repo
+        .workdir()
+        .ok_or(LitmusError::BareRepo)?
+        .canonicalize()
+        .map_err(|source| LitmusError::io(root, source))?;
+    let canonical_root = root
+        .canonicalize()
+        .map_err(|source| LitmusError::io(root, source))?;
+    let Ok(root_in_repo) = canonical_root.strip_prefix(&workdir) else {
+        return Ok(None);
+    };
+    let tree = revision_tree(&repo, revision)?;
+    let Ok(entry) = tree.get_path(&root_in_repo.join(path)) else {
+        return Ok(None);
+    };
+    let Ok(blob) = entry.to_object(&repo)?.peel_to_blob() else {
+        return Ok(None);
+    };
+    Ok(std::str::from_utf8(blob.content()).ok().map(str::to_string))
+}
+
 fn open_repository(root: &Path) -> Result<Repository> {
     Repository::discover(root).map_err(|_| LitmusError::RepoNotFound {
         path: root.to_path_buf(),
