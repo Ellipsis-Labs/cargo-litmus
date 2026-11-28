@@ -1374,10 +1374,13 @@ fn select_lockfile(
     path: &str,
     head: Option<&str>,
 ) -> std::result::Result<LockfileSelection, String> {
-    let workspace_root = path
-        .strip_suffix("Cargo.lock")
-        .unwrap_or(path)
-        .trim_end_matches('/');
+    // `cargo_input_kind` matches any name ending in `Cargo.lock`.
+    let workspace_root = if path == "Cargo.lock" {
+        ""
+    } else {
+        path.strip_suffix("/Cargo.lock")
+            .ok_or("it is not named Cargo.lock")?
+    };
     let workspace = indexed_workspaces(metadata)
         .into_iter()
         .find(|workspace| {
