@@ -37,6 +37,6 @@ pub use ferris::{FerrisCrate, FerrisPayload, FerrisWorkspace};
 pub use monorepo::{Monorepo, pkg, ws};
 pub use report::CommandMode;
 pub use scenario::{
-    check, check_selection, check_with_ferris, check_with_wrapped_cargo, create, delete, edit,
-    rename,
+    check, check_selection, check_selection_from, check_with_ferris, check_with_wrapped_cargo,
+    create, delete, edit, rename,
 };

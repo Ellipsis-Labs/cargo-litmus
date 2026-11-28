@@ -110,6 +110,19 @@ pub fn check_selection(
     changed_paths: &[&str],
     expect: &Expect,
 ) -> Report {
+    check_selection_from(name, monorepo, "", selection, changed_paths, expect)
+}
+
+/// Like [`check_selection`], with `--root` naming `root`, a directory relative
+/// to the repository.
+pub fn check_selection_from(
+    name: &str,
+    monorepo: &Monorepo,
+    root: &str,
+    selection: &[&str],
+    changed_paths: &[&str],
+    expect: &Expect,
+) -> Report {
     let scratch = TempDir::new().expect("scratch dir");
     let current_cache = scratch.path().join("current.rkyv");
     let bin_dir = ferris_shim_dir(scratch.path());
@@ -125,7 +138,14 @@ pub fn check_selection(
 
     let mut args = selection.to_vec();
     args.extend(["--current-cache", current_cache.to_str().expect("utf8")]);
-    run_affected(name, monorepo, &bin_dir, &args, expect)
+    run_affected(
+        name,
+        monorepo,
+        &monorepo.canonical_root().join(root),
+        &bin_dir,
+        &args,
+        expect,
+    )
 }
 
 #[derive(Default)]
@@ -147,8 +167,9 @@ fn run_scenario(
     let current_cache = scratch.path().join("current.rkyv");
     let bin_dir = ferris_shim_dir(scratch.path());
 
+    let root = monorepo.canonical_root();
     let base_output = run_litmus(
-        &monorepo,
+        &root,
         &bin_dir,
         &["index", "--cache", base_cache.to_str().expect("utf8")],
     );
@@ -172,6 +193,7 @@ fn run_scenario(
     run_affected(
         name,
         &monorepo,
+        &root,
         &bin_dir,
         &[
             "--base",
@@ -190,6 +212,7 @@ fn run_scenario(
 fn run_affected(
     name: &str,
     monorepo: &Monorepo,
+    root: &Path,
     bin_dir: &Path,
     args: &[&str],
     expect: &Expect,
@@ -197,7 +220,7 @@ fn run_affected(
     let mut command = vec!["affected"];
     command.extend(args);
     command.extend(["--format", "json"]);
-    let output = run_litmus(monorepo, bin_dir, &command);
+    let output = run_litmus(root, bin_dir, &command);
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     assert!(
@@ -236,13 +259,12 @@ fn apply_changes(monorepo: &Monorepo, changes: &[Change]) -> Vec<String> {
     paths
 }
 
-fn run_litmus(monorepo: &Monorepo, bin_dir: &Path, args: &[&str]) -> std::process::Output {
-    let root = monorepo.canonical_root();
+fn run_litmus(root: &Path, bin_dir: &Path, args: &[&str]) -> std::process::Output {
     Command::new(litmus_binary())
         .args(args)
         .arg("--root")
-        .arg(&root)
-        .current_dir(&root)
+        .arg(root)
+        .current_dir(root)
         .env("PATH", sanitized_path(bin_dir))
         .env_remove("LITMUS_BASE_CACHE")
         .env_remove("CARGO_TARGET_DIR")

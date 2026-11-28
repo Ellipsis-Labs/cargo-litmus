@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::changed_files::{
     ChangedFileInput, ChangedLineRange, file_at_revision, file_in_index, merge_changed_file_inputs,
+    repository_root,
 };
 use crate::config::{ConfiguredInput, LitmusConfig, RuleSelection};
 use crate::error::Result;
@@ -380,10 +381,13 @@ fn compute_affected_internal(
         .unwrap_or(CacheStatus::NoBaseCache);
     let base_reference = base.as_ref().and_then(|base| base.reference.clone());
     let changed_file_inputs = selected_changed_file_inputs(options);
+    // Changed paths are relative to the repository, which `root` may be a
+    // subdirectory of.
+    let repo_root = repository_root(&options.root).unwrap_or_else(|_| options.root.clone());
     // Read before indexing: `cargo metadata` may rewrite a lockfile that does
     // not match its manifests, and that rewrite must not be mistaken for the
     // change under test.
-    let lockfile_snapshots = snapshot_lockfiles(&options.root, &changed_file_inputs);
+    let lockfile_snapshots = snapshot_lockfiles(&repo_root, &changed_file_inputs);
     let current = match build_or_update_index(
         &IndexOptions {
             root: options.root.clone(),
@@ -459,6 +463,7 @@ fn compute_affected_internal(
     let configured_inputs = litmus_config.matches(selected_files.iter().cloned())?;
     let lockfile_selections = select_lockfile_packages(
         options,
+        &repo_root,
         current_metadata,
         &lockfile_snapshots,
         &configured_inputs,
@@ -826,20 +831,20 @@ fn explain_inputs(
             if let Some(package) = package {
                 insert_package_closure(metadata, ferris, &package.id);
             }
+            // A package that embeds the lockfile compiles its bytes, whatever
+            // they resolve to and whether or not the change is attributed.
+            let mut readers = metadata
+                .source_dependencies
+                .iter()
+                .filter(|dependency| dependency.target_path == *path)
+                .filter_map(|dependency| package_for_path(metadata, &dependency.source_path))
+                .map(|package| (package.id.clone(), package))
+                .collect::<BTreeMap<_, _>>();
+            for reader in readers.values() {
+                insert_package_closure(metadata, ferris, &reader.id);
+            }
             let lockfile_selection = lockfile_selections.get(path);
             if let Some(Ok(selection)) = lockfile_selection {
-                // A package that embeds the lockfile compiles its bytes,
-                // whatever they resolve to.
-                let mut readers = metadata
-                    .source_dependencies
-                    .iter()
-                    .filter(|dependency| dependency.target_path == *path)
-                    .filter_map(|dependency| package_for_path(metadata, &dependency.source_path))
-                    .map(|package| (package.id.clone(), package))
-                    .collect::<BTreeMap<_, _>>();
-                for reader in readers.values() {
-                    insert_package_closure(metadata, ferris, &reader.id);
-                }
                 if let Some(package) = package {
                     readers.insert(package.id.clone(), package);
                 }
@@ -1363,6 +1368,7 @@ fn snapshot_lockfiles(
 
 fn select_lockfile_packages(
     options: &AffectedOptions,
+    repo_root: &Path,
     metadata: &IndexMetadata,
     snapshots: &BTreeMap<String, Option<String>>,
     configured_inputs: &[ConfiguredInput],
@@ -1373,7 +1379,7 @@ fn select_lockfile_packages(
         .map(|(path, head)| {
             (
                 path.clone(),
-                select_lockfile(options, metadata, path, head.as_deref()),
+                select_lockfile(options, repo_root, metadata, path, head.as_deref()),
             )
         })
         .collect()
@@ -1384,6 +1390,7 @@ fn select_lockfile_packages(
 /// lockfile change selects members of that workspace and nothing beyond it.
 fn select_lockfile(
     options: &AffectedOptions,
+    repo_root: &Path,
     metadata: &IndexMetadata,
     path: &str,
     head: Option<&str>,
@@ -1408,7 +1415,7 @@ fn select_lockfile(
     // The index assigns packages to workspaces by directory, so it does not
     // place a member that lives elsewhere in this workspace.
     let workspace_manifest = Path::new(workspace_root).join("Cargo.toml");
-    match fs::read_to_string(options.root.join(workspace_manifest))
+    match fs::read_to_string(repo_root.join(workspace_manifest))
         .ok()
         .and_then(|manifest| workspace_lists_members_outside_its_directory(&manifest))
     {
@@ -1418,18 +1425,26 @@ fn select_lockfile(
         }
         None => return Err("its workspace manifest is not readable".to_string()),
     }
+    // A source that embeds the lockfile but belongs to no package cannot be
+    // traced to the packages that compile it.
+    if metadata.source_dependencies.iter().any(|dependency| {
+        dependency.target_path == path
+            && package_for_path(metadata, &dependency.source_path).is_none()
+    }) {
+        return Err("a source file outside every package embeds it".to_string());
+    }
     let head = head.ok_or("it is missing from the working tree")?;
-    if fs::read_to_string(options.root.join(path)).ok().as_deref() != Some(head) {
+    if fs::read_to_string(repo_root.join(path)).ok().as_deref() != Some(head) {
         return Err("it changed on disk while the index was built".to_string());
     }
     let requested_head = match &range.head {
         ChangeHead::WorkingTree => None,
-        ChangeHead::Index => match file_in_index(&options.root, path) {
+        ChangeHead::Index => match file_in_index(repo_root, path) {
             Ok(Some(staged)) if staged == head => None,
             _ => return Err("the working-tree copy differs from the staged copy".to_string()),
         },
         ChangeHead::Revision(revision) => {
-            match file_at_revision(&options.root, "HEAD", path) {
+            match file_at_revision(repo_root, "HEAD", path) {
                 Ok(Some(committed)) if committed == head => {}
                 _ => {
                     return Err(
@@ -1437,20 +1452,37 @@ fn select_lockfile(
                     );
                 }
             }
-            match file_at_revision(&options.root, revision, path) {
+            match file_at_revision(repo_root, revision, path) {
                 Ok(Some(requested)) => (requested != head).then_some(requested),
                 _ => return Err("the head revision has no readable copy".to_string()),
             }
         }
     };
-    let base = match file_at_revision(&options.root, &range.base, path) {
+    let base = match file_at_revision(repo_root, &range.base, path) {
         Ok(Some(base)) => base,
         _ => return Err("the base revision has no readable copy".to_string()),
     };
+    // A lockfile named as changed that is the same over the range was not
+    // changed by what the range measures, so the range cannot explain it.
+    if base == head && requested_head.is_none() {
+        return Err("it does not differ from the base revision".to_string());
+    }
     let mut change = lockfile_change(&base, head).map_err(|uncertainty| uncertainty.to_string())?;
     if let Some(requested) = requested_head {
         change.merge(
             lockfile_change(&base, &requested).map_err(|uncertainty| uncertainty.to_string())?,
+        );
+    }
+    if reaches_package_indexed_elsewhere(
+        &metadata.packages,
+        &workspace.name,
+        workspace_root,
+        &change.affected_path_packages,
+    ) {
+        return Err(
+            "it reaches a package beneath its workspace directory that is indexed under another \
+             workspace"
+                .to_string(),
         );
     }
     let packages = metadata
@@ -1478,10 +1510,12 @@ fn select_lockfile(
     })
 }
 
-/// Whether a workspace manifest lists a member that is not beneath the
+/// Whether a workspace manifest lists a member that may lie outside the
 /// manifest's directory. Returns `None` when the manifest does not parse. A
 /// package can only join a workspace from outside its directory by being
-/// listed, so the member list is the whole answer.
+/// listed, so the member list is the whole answer. Any `..` counts, wherever
+/// it appears: after a glob it can no longer be resolved by reading the
+/// pattern.
 fn workspace_lists_members_outside_its_directory(manifest: &str) -> Option<bool> {
     let manifest = toml::from_str::<toml::Table>(manifest).ok()?;
     let Some(members) = manifest
@@ -1490,29 +1524,30 @@ fn workspace_lists_members_outside_its_directory(manifest: &str) -> Option<bool>
     else {
         return Some(false);
     };
-    let members = members.as_array()?;
     let mut outside = false;
-    for member in members {
-        outside |= leaves_its_directory(Path::new(member.as_str()?));
+    for member in members.as_array()? {
+        outside |= Path::new(member.as_str()?)
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_) | Component::CurDir));
     }
     Some(outside)
 }
 
-/// Whether a relative path, read lexically, steps above where it starts.
-fn leaves_its_directory(path: &Path) -> bool {
-    let mut depth = 0_usize;
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::Normal(_) => depth += 1,
-            Component::ParentDir => match depth.checked_sub(1) {
-                Some(above) => depth = above,
-                None => return true,
-            },
-            Component::RootDir | Component::Prefix(_) => return true,
-        }
-    }
-    false
+/// Whether a lockfile reaches a package that lies beneath its workspace's
+/// directory but that the index files under another workspace. A nested
+/// workspace can exclude such a package and leave it a member of the outer
+/// one, which the index's directory-based assignment cannot show.
+fn reaches_package_indexed_elsewhere(
+    packages: &[PackageNode],
+    workspace: &str,
+    workspace_root: &str,
+    affected_path_packages: &BTreeSet<String>,
+) -> bool {
+    packages.iter().any(|package| {
+        package.workspace != workspace
+            && affected_path_packages.contains(&package.name)
+            && path_is_in_workspace(&package.root_path, workspace_root)
+    })
 }
 
 /// `readers` are the packages that consume the lockfile as a file: the one
@@ -1564,13 +1599,18 @@ fn lockfile_explanation(
             selection.changed_packages.len() - LISTED_CHANGES
         ));
     }
+    let reason = if selection.changed_packages.is_empty() {
+        "lockfile changes leave every locked package as it was".to_string()
+    } else {
+        format!(
+            "lockfile changes ({changed}) select the workspace packages whose locked dependency \
+             closure contains a changed package"
+        )
+    };
     InputExplanation {
         path: path.to_string(),
         kind: InputKind::CargoLock,
-        reason: format!(
-            "lockfile changes ({changed}) select the workspace packages whose locked dependency \
-             closure contains a changed package"
-        ),
+        reason,
         packages: selected
             .iter()
             .map(|package| package.name.clone())
@@ -3780,16 +3820,51 @@ mod platform;
     #[test]
     fn workspace_member_outside_the_workspace_directory_is_detected() {
         let outside = "[workspace]\nmembers = [\"api\", \"../shared/foo\"]\n";
-        let inside = "[workspace]\nmembers = [\"api\", \"crates/*\", \"crates/../api\"]\n";
+        // `**` can match nothing, which leaves `../outside`.
+        let behind_a_glob = "[workspace]\nmembers = [\"**/../outside\"]\n";
+        let inside = "[workspace]\nmembers = [\"api\", \"./crates/*\"]\n";
 
         assert_eq!(
             workspace_lists_members_outside_its_directory(outside),
             Some(true)
         );
         assert_eq!(
+            workspace_lists_members_outside_its_directory(behind_a_glob),
+            Some(true)
+        );
+        assert_eq!(
             workspace_lists_members_outside_its_directory(inside),
             Some(false)
         );
+    }
+
+    /// `nested/member` belongs to the outer workspace, but the index files it
+    /// under the nested workspace whose directory contains it, so the outer
+    /// lockfile's selection skipped it.
+    #[test]
+    fn lockfile_reaching_a_package_indexed_under_a_nested_workspace_is_detected() {
+        let package = |name: &str, workspace: &str, root_path: &str| PackageNode {
+            id: format!("path+{root_path}"),
+            name: name.to_string(),
+            workspace: workspace.to_string(),
+            workspace_path: String::new(),
+            manifest_path: format!("{root_path}/Cargo.toml"),
+            root_path: root_path.to_string(),
+        };
+        let packages = [
+            package("app", "outer", "outer/app"),
+            package("member", "nested", "outer/nested/member"),
+            package("elsewhere", "other", "other/elsewhere"),
+        ];
+        let reaches = |names: &[&str]| {
+            let affected = names.iter().map(ToString::to_string).collect();
+            reaches_package_indexed_elsewhere(&packages, "outer", "outer", &affected)
+        };
+
+        assert!(reaches(&["app", "member"]));
+        // A path dependency that lives in another workspace's directory is
+        // tested against that workspace's lockfile.
+        assert!(!reaches(&["app", "elsewhere"]));
     }
 
     #[test]

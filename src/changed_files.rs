@@ -179,16 +179,23 @@ pub fn changed_file_inputs_from_revs(
     Ok(ChangeSet::revisions(root, base_rev, head_rev)?.files)
 }
 
-/// Read a UTF-8 file as committed at `revision`. `path` is relative to `root`.
+/// The working directory of the repository that contains `root`. Changed
+/// paths are relative to it, whichever subdirectory `root` names.
+pub fn repository_root(root: &Path) -> Result<PathBuf> {
+    Ok(open_repository(root)?
+        .workdir()
+        .ok_or(LitmusError::BareRepo)?
+        .to_path_buf())
+}
+
+/// Read a UTF-8 file as committed at `revision` in the repository that
+/// contains `root`. `path` is relative to the repository's working directory.
 /// Returns `None` when the revision does not contain the file or the file is
 /// not valid UTF-8.
 pub fn file_at_revision(root: &Path, revision: &str, path: &str) -> Result<Option<String>> {
     let repo = open_repository(root)?;
-    let Some(repo_path) = path_in_repository(&repo, root, path)? else {
-        return Ok(None);
-    };
     let tree = revision_tree(&repo, revision)?;
-    let Ok(entry) = tree.get_path(&repo_path) else {
+    let Ok(entry) = tree.get_path(Path::new(path)) else {
         return Ok(None);
     };
     let Ok(blob) = entry.to_object(&repo)?.peel_to_blob() else {
@@ -197,36 +204,17 @@ pub fn file_at_revision(root: &Path, revision: &str, path: &str) -> Result<Optio
     Ok(std::str::from_utf8(blob.content()).ok().map(str::to_string))
 }
 
-/// Read a UTF-8 file as staged in the Git index. `path` is relative to `root`.
-/// Returns `None` when the index does not contain the file, holds it in a
-/// merge conflict, or the file is not valid UTF-8.
+/// Read a UTF-8 file as staged in the index of the repository that contains
+/// `root`. `path` is relative to the repository's working directory. Returns
+/// `None` when the index does not contain the file, holds it in a merge
+/// conflict, or the file is not valid UTF-8.
 pub fn file_in_index(root: &Path, path: &str) -> Result<Option<String>> {
     let repo = open_repository(root)?;
-    let Some(repo_path) = path_in_repository(&repo, root, path)? else {
-        return Ok(None);
-    };
-    let Some(entry) = repo.index()?.get_path(&repo_path, 0) else {
+    let Some(entry) = repo.index()?.get_path(Path::new(path), 0) else {
         return Ok(None);
     };
     let blob = repo.find_blob(entry.id)?;
     Ok(std::str::from_utf8(blob.content()).ok().map(str::to_string))
-}
-
-/// `path`, given relative to `root`, as a path relative to the repository's
-/// working directory. Returns `None` when `root` lies outside it.
-fn path_in_repository(repo: &Repository, root: &Path, path: &str) -> Result<Option<PathBuf>> {
-    let workdir = repo
-        .workdir()
-        .ok_or(LitmusError::BareRepo)?
-        .canonicalize()
-        .map_err(|source| LitmusError::io(root, source))?;
-    let canonical_root = root
-        .canonicalize()
-        .map_err(|source| LitmusError::io(root, source))?;
-    Ok(canonical_root
-        .strip_prefix(&workdir)
-        .ok()
-        .map(|root_in_repo| root_in_repo.join(path)))
 }
 
 fn open_repository(root: &Path) -> Result<Repository> {

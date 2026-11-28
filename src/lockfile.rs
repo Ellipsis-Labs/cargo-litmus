@@ -241,6 +241,8 @@ fn package_key(entry: &Table) -> Option<PackageKey> {
 
 /// Resolve a dependency reference, written `name`, `name version`, or
 /// `name version (source)` with only as much detail as disambiguation needs.
+/// A reference names a Git source without the commit it is locked to, which
+/// the package's own `source` carries after `#`.
 fn resolve_reference<'a>(
     keys_by_name: &BTreeMap<&str, Vec<&'a PackageKey>>,
     reference: &str,
@@ -254,10 +256,17 @@ fn resolve_reference<'a>(
     };
     let mut candidates = keys_by_name.get(name)?.iter().copied().filter(|key| {
         version.is_none_or(|version| key.version == version)
-            && source.is_none_or(|source| key.source.as_deref() == Some(source))
+            && source.is_none_or(|source| {
+                key.source.as_deref().map(without_locked_commit)
+                    == Some(without_locked_commit(source))
+            })
     });
     let candidate = candidates.next()?;
     candidates.next().is_none().then_some(candidate)
+}
+
+fn without_locked_commit(source: &str) -> &str {
+    source.split_once('#').map_or(source, |(source, _)| source)
 }
 
 #[cfg(test)]
@@ -378,6 +387,31 @@ mod tests {
         };
 
         let change = lockfile_change(&workspace("b1"), &workspace("b2")).unwrap();
+
+        assert_eq!(change.affected_path_packages, names(&["app"]));
+    }
+
+    #[test]
+    fn git_reference_without_the_locked_commit_resolves() {
+        // Two `auth` packages force `app` to name a source, and Cargo writes
+        // that reference without the commit the package entry is locked to.
+        const GIT: &str = "git+https://example.com/auth?branch=main";
+        let reference = format!("auth 1.0.0 ({GIT})");
+        let workspace = |commit: &str| {
+            lockfile(
+                4,
+                &[
+                    path_package("app", &[reference.as_str()]),
+                    format!(
+                        "[[package]]\nname = \"auth\"\nversion = \"1.0.0\"\nsource = \
+                         \"{GIT}#{commit}\"\n"
+                    ),
+                    registry_package("auth", "1.0.0", "a1", &[]),
+                ],
+            )
+        };
+
+        let change = lockfile_change(&workspace("aaa"), &workspace("bbb")).unwrap();
 
         assert_eq!(change.affected_path_packages, names(&["app"]));
     }
