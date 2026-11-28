@@ -90,10 +90,7 @@ pub fn lockfile_change(base: &str, head: &str) -> Result<LockfileChange, Lockfil
     let mut affected_path_packages = base.path_packages_reaching(&changed);
     affected_path_packages.extend(head.path_packages_reaching(&changed));
     Ok(LockfileChange {
-        changed_packages: changed
-            .iter()
-            .map(|key| format!("{} {}", key.name, key.version))
-            .collect(),
+        changed_packages: changed.iter().map(PackageKey::label).collect(),
         changed_path_packages: changed
             .iter()
             .filter(|key| key.source.is_none())
@@ -170,13 +167,9 @@ impl Lockfile {
         for (key, entry) in &packages {
             let references = match entry.get("dependencies") {
                 None => &Vec::new(),
-                Some(Value::Array(references)) => references,
-                Some(_) => {
-                    return Err(invalid(format!(
-                        "dependencies of {} are not an array",
-                        key.label()
-                    )));
-                }
+                Some(references) => references.as_array().ok_or_else(|| {
+                    invalid(format!("dependencies of {} are not an array", key.label()))
+                })?,
             };
             // Under a `[replace]` override the replaced package lists no
             // dependencies and names its stand-in under `replace`, so that
@@ -228,14 +221,14 @@ impl Lockfile {
 }
 
 fn package_key(entry: &Table) -> Option<PackageKey> {
-    let source = match entry.get("source") {
-        None => None,
-        Some(source) => Some(source.as_str()?.to_string()),
-    };
+    let field = |name: &str| Some(entry.get(name)?.as_str()?.to_string());
     Some(PackageKey {
-        name: entry.get("name")?.as_str()?.to_string(),
-        version: entry.get("version")?.as_str()?.to_string(),
-        source,
+        name: field("name")?,
+        version: field("version")?,
+        source: match entry.get("source") {
+            None => None,
+            Some(_) => Some(field("source")?),
+        },
     })
 }
 

@@ -100,22 +100,11 @@ pub fn check_with_wrapped_cargo(
     )
 }
 
-/// Runs `affected` with the given change-selection arguments against the
-/// repository as it stands, for scenarios whose checkout is not the head of
-/// the change being measured. `changed_paths` scripts ferris-wheel.
+/// Runs `affected` from `root`, a directory relative to the repository, with
+/// the given change-selection arguments against the repository as it stands,
+/// for scenarios whose checkout is not the head of the change being measured.
+/// `changed_paths` scripts ferris-wheel.
 pub fn check_selection(
-    name: &str,
-    monorepo: &Monorepo,
-    selection: &[&str],
-    changed_paths: &[&str],
-    expect: &Expect,
-) -> Report {
-    check_selection_from(name, monorepo, "", selection, changed_paths, expect)
-}
-
-/// Like [`check_selection`], with `--root` naming `root`, a directory relative
-/// to the repository.
-pub fn check_selection_from(
     name: &str,
     monorepo: &Monorepo,
     root: &str,

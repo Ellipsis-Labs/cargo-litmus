@@ -188,33 +188,27 @@ pub fn repository_root(root: &Path) -> Result<PathBuf> {
         .to_path_buf())
 }
 
-/// Read a UTF-8 file as committed at `revision` in the repository that
-/// contains `root`. `path` is relative to the repository's working directory.
-/// Returns `None` when the revision does not contain the file or the file is
-/// not valid UTF-8.
-pub fn file_at_revision(root: &Path, revision: &str, path: &str) -> Result<Option<String>> {
-    let repo = open_repository(root)?;
-    let tree = revision_tree(&repo, revision)?;
-    let Ok(entry) = tree.get_path(Path::new(path)) else {
-        return Ok(None);
+/// Read a UTF-8 file from the repository that contains `root`, as committed
+/// at `revision`, or as staged in the index when `revision` is `None`. `path`
+/// is relative to the repository's working directory. Returns `None` when the
+/// file cannot be read there, is held in a merge conflict, or is not valid
+/// UTF-8.
+pub fn file_at(root: &Path, revision: Option<&str>, path: &str) -> Option<String> {
+    let repo = open_repository(root).ok()?;
+    let blob = match revision {
+        Some(revision) => revision_tree(&repo, revision)
+            .ok()?
+            .get_path(Path::new(path))
+            .ok()?
+            .to_object(&repo)
+            .ok()?
+            .peel_to_blob()
+            .ok()?,
+        None => repo
+            .find_blob(repo.index().ok()?.get_path(Path::new(path), 0)?.id)
+            .ok()?,
     };
-    let Ok(blob) = entry.to_object(&repo)?.peel_to_blob() else {
-        return Ok(None);
-    };
-    Ok(std::str::from_utf8(blob.content()).ok().map(str::to_string))
-}
-
-/// Read a UTF-8 file as staged in the index of the repository that contains
-/// `root`. `path` is relative to the repository's working directory. Returns
-/// `None` when the index does not contain the file, holds it in a merge
-/// conflict, or the file is not valid UTF-8.
-pub fn file_in_index(root: &Path, path: &str) -> Result<Option<String>> {
-    let repo = open_repository(root)?;
-    let Some(entry) = repo.index()?.get_path(Path::new(path), 0) else {
-        return Ok(None);
-    };
-    let blob = repo.find_blob(entry.id)?;
-    Ok(std::str::from_utf8(blob.content()).ok().map(str::to_string))
+    std::str::from_utf8(blob.content()).ok().map(str::to_string)
 }
 
 fn open_repository(root: &Path) -> Result<Repository> {

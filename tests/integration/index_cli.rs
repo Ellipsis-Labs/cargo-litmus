@@ -570,7 +570,7 @@ fn affected_uses_ferris_ripples_for_package_selection() {
             changed_files: Vec::new(),
             base_cache: None,
             current_cache: None,
-            change_range: None,
+            change_source: None,
         },
         &MockFerrisRunner::default(),
     )
@@ -604,7 +604,7 @@ fn affected_uses_warm_base_cache_for_file_diagnostics() {
             changed_files: Vec::new(),
             base_cache: Some(base_cache),
             current_cache: Some(current_cache.clone()),
-            change_range: None,
+            change_source: None,
         },
         &MockFerrisRunner::default(),
     )
@@ -874,7 +874,7 @@ fn arbitrary_package_root_input_selects_package_without_uncertainty() {
             changed_files: Vec::new(),
             base_cache: None,
             current_cache: None,
-            change_range: None,
+            change_source: None,
         },
         &MultiWorkspaceFerrisRunner,
     )
@@ -925,7 +925,7 @@ fn included_repository_input_maps_back_to_owning_package() {
             changed_files: Vec::new(),
             base_cache: None,
             current_cache: None,
-            change_range: None,
+            change_source: None,
         },
         &MultiWorkspaceFerrisRunner,
     )
@@ -969,7 +969,7 @@ fn indexed_included_rust_source_selects_consuming_package() {
             changed_files: Vec::new(),
             base_cache: None,
             current_cache: None,
-            change_range: None,
+            change_source: None,
         },
         &MockFerrisRunner::default(),
     )
@@ -1005,7 +1005,7 @@ fn cargo_config_is_reported_distinctly_and_fails_wide() {
             changed_files: Vec::new(),
             base_cache: None,
             current_cache: None,
-            change_range: None,
+            change_source: None,
         },
         &MultiWorkspaceFerrisRunner,
     )
@@ -1044,7 +1044,7 @@ fn rust_toolchain_is_reported_distinctly_and_fails_wide() {
             changed_files: Vec::new(),
             base_cache: None,
             current_cache: None,
-            change_range: None,
+            change_source: None,
         },
         &MultiWorkspaceFerrisRunner,
     )
@@ -1117,7 +1117,7 @@ fn configured_non_rust_input_selects_named_package_without_uncertainty() {
             changed_files: Vec::new(),
             base_cache: None,
             current_cache: None,
-            change_range: None,
+            change_source: None,
         },
         &MockFerrisRunner::default(),
     )
@@ -1169,7 +1169,7 @@ fn configured_package_input_selects_reverse_dependents() {
             changed_files: Vec::new(),
             base_cache: None,
             current_cache: None,
-            change_range: None,
+            change_source: None,
         },
         &MockFerrisRunner::default(),
     )
@@ -1233,7 +1233,7 @@ fn configured_input_is_not_dropped_by_mixed_test_only_selection() {
             changed_files: Vec::new(),
             base_cache: None,
             current_cache: None,
-            change_range: None,
+            change_source: None,
         },
         &MockFerrisRunner::default(),
     )
@@ -1271,7 +1271,7 @@ fn generated_output_without_static_relationship_remains_uncertain() {
             changed_files: Vec::new(),
             base_cache: None,
             current_cache: None,
-            change_range: None,
+            change_source: None,
         },
         &MultiWorkspaceFerrisRunner,
     )
@@ -1294,7 +1294,7 @@ fn affected_unknown_file_outside_affected_workspaces_fails_globally() {
             changed_files: Vec::new(),
             base_cache: None,
             current_cache: None,
-            change_range: None,
+            change_source: None,
         },
         &MultiWorkspaceFerrisRunner,
     )
@@ -1321,7 +1321,7 @@ fn affected_missing_file_fails_wide() {
             changed_files: Vec::new(),
             base_cache: None,
             current_cache: None,
-            change_range: None,
+            change_source: None,
         },
         &MockFerrisRunner::default(),
     )
@@ -1343,7 +1343,7 @@ fn affected_malformed_current_source_fails_wide() {
             changed_files: Vec::new(),
             base_cache: None,
             current_cache: None,
-            change_range: None,
+            change_source: None,
         },
         &MockFerrisRunner::default(),
     )
@@ -1490,7 +1490,7 @@ fn root_path_affected(
             changed_files: Vec::new(),
             base_cache: None,
             current_cache: None,
-            change_range: None,
+            change_source: None,
         },
         runner,
     )
@@ -1544,7 +1544,7 @@ fn root_package_cfg_test_module_keeps_qualified_filter() {
             }],
             base_cache: None,
             current_cache: None,
-            change_range: None,
+            change_source: None,
         },
         &runner,
     )
