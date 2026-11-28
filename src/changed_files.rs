@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use git2::{Delta, Diff, DiffFindOptions, DiffOptions, ObjectType, Oid, Repository, Tree};
 use serde::{Deserialize, Serialize};
@@ -184,6 +184,37 @@ pub fn changed_file_inputs_from_revs(
 /// not valid UTF-8.
 pub fn file_at_revision(root: &Path, revision: &str, path: &str) -> Result<Option<String>> {
     let repo = open_repository(root)?;
+    let Some(repo_path) = path_in_repository(&repo, root, path)? else {
+        return Ok(None);
+    };
+    let tree = revision_tree(&repo, revision)?;
+    let Ok(entry) = tree.get_path(&repo_path) else {
+        return Ok(None);
+    };
+    let Ok(blob) = entry.to_object(&repo)?.peel_to_blob() else {
+        return Ok(None);
+    };
+    Ok(std::str::from_utf8(blob.content()).ok().map(str::to_string))
+}
+
+/// Read a UTF-8 file as staged in the Git index. `path` is relative to `root`.
+/// Returns `None` when the index does not contain the file, holds it in a
+/// merge conflict, or the file is not valid UTF-8.
+pub fn file_in_index(root: &Path, path: &str) -> Result<Option<String>> {
+    let repo = open_repository(root)?;
+    let Some(repo_path) = path_in_repository(&repo, root, path)? else {
+        return Ok(None);
+    };
+    let Some(entry) = repo.index()?.get_path(&repo_path, 0) else {
+        return Ok(None);
+    };
+    let blob = repo.find_blob(entry.id)?;
+    Ok(std::str::from_utf8(blob.content()).ok().map(str::to_string))
+}
+
+/// `path`, given relative to `root`, as a path relative to the repository's
+/// working directory. Returns `None` when `root` lies outside it.
+fn path_in_repository(repo: &Repository, root: &Path, path: &str) -> Result<Option<PathBuf>> {
     let workdir = repo
         .workdir()
         .ok_or(LitmusError::BareRepo)?
@@ -192,17 +223,10 @@ pub fn file_at_revision(root: &Path, revision: &str, path: &str) -> Result<Optio
     let canonical_root = root
         .canonicalize()
         .map_err(|source| LitmusError::io(root, source))?;
-    let Ok(root_in_repo) = canonical_root.strip_prefix(&workdir) else {
-        return Ok(None);
-    };
-    let tree = revision_tree(&repo, revision)?;
-    let Ok(entry) = tree.get_path(&root_in_repo.join(path)) else {
-        return Ok(None);
-    };
-    let Ok(blob) = entry.to_object(&repo)?.peel_to_blob() else {
-        return Ok(None);
-    };
-    Ok(std::str::from_utf8(blob.content()).ok().map(str::to_string))
+    Ok(canonical_root
+        .strip_prefix(&workdir)
+        .ok()
+        .map(|root_in_repo| root_in_repo.join(path)))
 }
 
 fn open_repository(root: &Path) -> Result<Repository> {

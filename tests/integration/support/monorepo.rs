@@ -369,6 +369,13 @@ impl Monorepo {
         fs::rename(self.dir.path().join(from), target).expect("rename file");
     }
 
+    /// Stage one path as it stands in the working tree, without committing.
+    pub fn stage(&self, rel: &str) {
+        let mut index = self.repo.index().expect("index");
+        index.add_path(Path::new(rel)).expect("stage path");
+        index.write().expect("write index");
+    }
+
     /// Stage everything and commit; returns the commit id.
     ///
     /// `cargo metadata` backfills `Cargo.lock` into workspace roots during

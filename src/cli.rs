@@ -6,7 +6,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 
 use crate::affected::{
-    AffectedOptions, AffectedReport, compute_affected, compute_affected_validated,
+    AffectedOptions, AffectedReport, ChangeHead, ChangeRange, compute_affected,
+    compute_affected_validated,
 };
 use crate::changed_files::{
     ChangeSet, ChangeSource, ChangedFileInput, merge_changed_file_inputs, parse_changed_file_inputs,
@@ -200,8 +201,7 @@ pub fn execute(cli: Cli) -> Result<()> {
         } => {
             let ChangeInputs {
                 files: changed_files,
-                base_revision,
-                head_is_working_tree,
+                change_range,
             } = collect_changed_files(ChangeInputOptions {
                 root: &root,
                 files,
@@ -218,8 +218,7 @@ pub fn execute(cli: Cli) -> Result<()> {
                 changed_files,
                 base_cache: base_cache.or_else(default_base_cache),
                 current_cache,
-                base_revision,
-                head_is_working_tree,
+                change_range,
             };
             let report = if validate_nextest {
                 compute_affected_validated(&options, &CommandFerrisRunner)?
@@ -251,8 +250,7 @@ pub fn execute(cli: Cli) -> Result<()> {
                     changed_files: vec![ChangedFileInput::path_only(path.clone())],
                     base_cache: None,
                     current_cache,
-                    base_revision: None,
-                    head_is_working_tree: false,
+                    change_range: None,
                 };
                 let affected = if validate_nextest {
                     compute_affected_validated(&options, &CommandFerrisRunner)?
@@ -324,12 +322,10 @@ struct ChangeInputOptions<'a> {
     staged: bool,
 }
 
-/// Changed files plus the base revision they were diffed from, when known, and
-/// whether they were diffed to the working tree rather than to a commit.
+/// Changed files plus the Git range they were diffed over, when known.
 struct ChangeInputs {
     files: Vec<ChangedFileInput>,
-    base_revision: Option<String>,
-    head_is_working_tree: bool,
+    change_range: Option<ChangeRange>,
 }
 
 fn collect_changed_files(options: ChangeInputOptions<'_>) -> Result<ChangeInputs> {
@@ -353,30 +349,40 @@ fn collect_changed_files(options: ChangeInputOptions<'_>) -> Result<ChangeInputs
             .map_err(|source| crate::error::LitmusError::io("stdin", source))?;
         changed_files.extend(parse_changed_file_inputs(&raw));
     }
-    let mut base_revision = None;
-    let head_is_working_tree = worktree || staged;
+    let mut change_range = None;
     if let (Some(base_rev), Some(head_rev)) = (base_rev, head_rev) {
         let revision_files = ChangeSet::revisions(root, &base_rev, &head_rev)?.files;
         changed_files = merge_revision_changed_files(changed_files, revision_files);
-        base_revision = Some(base_rev);
+        change_range = Some(ChangeRange {
+            base: base_rev,
+            head: ChangeHead::Revision(head_rev),
+        });
     } else if let Some(upstream) = merge_base {
         let change_set = ChangeSet::merge_base(root, &upstream)?;
-        if let ChangeSource::MergeBase { base, .. } = &change_set.source {
-            base_revision = Some(base.clone());
+        if let ChangeSource::MergeBase { base, head, .. } = &change_set.source {
+            change_range = Some(ChangeRange {
+                base: base.clone(),
+                head: ChangeHead::Revision(head.clone()),
+            });
         }
         changed_files.extend(change_set.files);
     } else if worktree {
         changed_files.extend(ChangeSet::worktree(root)?.files);
-        base_revision = Some("HEAD".to_string());
+        change_range = Some(ChangeRange {
+            base: "HEAD".to_string(),
+            head: ChangeHead::WorkingTree,
+        });
     } else if staged {
         changed_files.extend(ChangeSet::staged(root)?.files);
-        base_revision = Some("HEAD".to_string());
+        change_range = Some(ChangeRange {
+            base: "HEAD".to_string(),
+            head: ChangeHead::Index,
+        });
     }
 
     Ok(ChangeInputs {
         files: merge_changed_file_inputs(changed_files),
-        base_revision,
-        head_is_working_tree,
+        change_range,
     })
 }
 

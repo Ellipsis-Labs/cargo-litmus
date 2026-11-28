@@ -54,6 +54,17 @@ pub struct LockfileChange {
     pub affected_path_packages: BTreeSet<String>,
 }
 
+impl LockfileChange {
+    /// Add the packages another change can affect.
+    pub fn merge(&mut self, other: Self) {
+        self.changed_packages.extend(other.changed_packages);
+        self.changed_path_packages
+            .extend(other.changed_path_packages);
+        self.affected_path_packages
+            .extend(other.affected_path_packages);
+    }
+}
+
 /// Compare two lockfiles of the same workspace.
 ///
 /// Removed packages are traced through the base graph and added or changed
@@ -167,7 +178,10 @@ impl Lockfile {
                     )));
                 }
             };
-            for reference in references {
+            // Under a `[replace]` override the replaced package lists no
+            // dependencies and names its stand-in under `replace`, so that
+            // reference is the only edge from its dependents to the stand-in.
+            for reference in references.iter().chain(entry.get("replace")) {
                 let unresolved = || LockfileUncertainty::UnresolvedDependency {
                     side,
                     package: key.label(),
@@ -337,6 +351,35 @@ mod tests {
 
         assert_eq!(change.affected_path_packages, names(&["cli"]));
         assert_eq!(change.changed_path_packages, names(&["cli"]));
+    }
+
+    #[test]
+    fn change_behind_a_replaced_package_reaches_its_dependents() {
+        // `app` depends on the registry `bar`, which `[replace]` swaps for a
+        // fork. Only the fork lists `baz`, and only `replace` links the two.
+        const FORK: &str = "git+https://example.com/bar#abc";
+        let registry_bar = format!("bar 1.0.0 ({REGISTRY})");
+        let workspace = |baz_checksum: &str| {
+            lockfile(
+                4,
+                &[
+                    path_package("app", &[registry_bar.as_str()]),
+                    format!(
+                        "[[package]]\nname = \"bar\"\nversion = \"1.0.0\"\nsource = \
+                         \"{REGISTRY}\"\nreplace = \"bar 1.0.0 ({FORK})\"\n"
+                    ),
+                    format!(
+                        "[[package]]\nname = \"bar\"\nversion = \"1.0.0\"\nsource = \
+                         \"{FORK}\"\ndependencies = [\n \"baz\",\n]\n"
+                    ),
+                    registry_package("baz", "1.0.0", baz_checksum, &[]),
+                ],
+            )
+        };
+
+        let change = lockfile_change(&workspace("b1"), &workspace("b2")).unwrap();
+
+        assert_eq!(change.affected_path_packages, names(&["app"]));
     }
 
     #[test]

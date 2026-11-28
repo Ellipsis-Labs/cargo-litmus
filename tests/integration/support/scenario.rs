@@ -100,6 +100,34 @@ pub fn check_with_wrapped_cargo(
     )
 }
 
+/// Runs `affected` with the given change-selection arguments against the
+/// repository as it stands, for scenarios whose checkout is not the head of
+/// the change being measured. `changed_paths` scripts ferris-wheel.
+pub fn check_selection(
+    name: &str,
+    monorepo: &Monorepo,
+    selection: &[&str],
+    changed_paths: &[&str],
+    expect: &Expect,
+) -> Report {
+    let scratch = TempDir::new().expect("scratch dir");
+    let current_cache = scratch.path().join("current.rkyv");
+    let bin_dir = ferris_shim_dir(scratch.path());
+    let changed_paths = changed_paths
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    write_ferris_shim(
+        &bin_dir,
+        &ferris_payload(monorepo, &changed_paths),
+        &lineup_payload(monorepo),
+    );
+
+    let mut args = selection.to_vec();
+    args.extend(["--current-cache", current_cache.to_str().expect("utf8")]);
+    run_affected(name, monorepo, &bin_dir, &args, expect)
+}
+
 #[derive(Default)]
 struct RunOptions {
     ferris_override: Option<FerrisPayload>,
@@ -141,11 +169,11 @@ fn run_scenario(
         write_cargo_wrapper(&bin_dir);
     }
 
-    let output = run_litmus(
+    run_affected(
+        name,
         &monorepo,
         &bin_dir,
         &[
-            "affected",
             "--base",
             &base,
             "--head",
@@ -154,10 +182,22 @@ fn run_scenario(
             base_cache.to_str().expect("utf8"),
             "--current-cache",
             current_cache.to_str().expect("utf8"),
-            "--format",
-            "json",
         ],
-    );
+        expect,
+    )
+}
+
+fn run_affected(
+    name: &str,
+    monorepo: &Monorepo,
+    bin_dir: &Path,
+    args: &[&str],
+    expect: &Expect,
+) -> Report {
+    let mut command = vec!["affected"];
+    command.extend(args);
+    command.extend(["--format", "json"]);
+    let output = run_litmus(monorepo, bin_dir, &command);
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     assert!(
@@ -170,7 +210,7 @@ fn run_scenario(
         panic!("scenario {name}: report is not valid JSON: {error}\n{stdout}")
     });
 
-    assert_expectations(name, &monorepo, &report, expect);
+    assert_expectations(name, monorepo, &report, expect);
     report
 }
 

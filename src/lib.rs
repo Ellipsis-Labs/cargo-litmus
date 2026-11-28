@@ -23,7 +23,7 @@
 //! ```no_run
 //! use std::path::PathBuf;
 //!
-//! use cargo_litmus::affected::{AffectedOptions, compute_affected};
+//! use cargo_litmus::affected::{AffectedOptions, ChangeHead, ChangeRange, compute_affected};
 //! use cargo_litmus::changed_files::ChangeSet;
 //! use cargo_litmus::ferris::CommandFerrisRunner;
 //!
@@ -36,8 +36,10 @@
 //!         changed_files: changes.files,
 //!         base_cache: None,
 //!         current_cache: None,
-//!         base_revision: Some("HEAD".to_string()),
-//!         head_is_working_tree: true,
+//!         change_range: Some(ChangeRange {
+//!             base: "HEAD".to_string(),
+//!             head: ChangeHead::WorkingTree,
+//!         }),
 //!     },
 //!     &CommandFerrisRunner,
 //! )?;
