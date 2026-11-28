@@ -631,24 +631,87 @@ fn lockfile_embedded_by_a_source_outside_every_package_widens_its_workspace() {
 }
 
 /// A lockfile that cannot be attributed widens only its own workspace, which
-/// left out `audit`, a package of another workspace that embeds it.
+/// left out `audit`, a package of another workspace that embeds it. The
+/// test-only edit in `helper` must not narrow `tools` down to `helper` and
+/// drop `audit` again.
 #[test]
 fn unattributed_lockfile_selects_a_package_in_another_workspace_that_embeds_it() {
-    let monorepo =
-        Monorepo::new(vec![
-            ws("svc").lockfile().package(pkg("core")),
-            ws("tools").package(pkg("audit").lib_source(
+    let monorepo = Monorepo::new(vec![
+        ws("svc").lockfile().package(pkg("core")),
+        ws("tools")
+            .package(pkg("audit").lib_source(
                 "pub const LOCKFILE: &str = include_str!(\"../../../svc/Cargo.lock\");\n",
-            )),
-        ]);
+            ))
+            .package(pkg("helper").file("tests/smoke.rs", "#[test]\nfn smoke() {}\n")),
+    ]);
     monorepo.commit("base");
     check_selection(
         "unattributed_lockfile_selects_a_package_in_another_workspace_that_embeds_it",
         &monorepo,
-        &["--files", "svc/Cargo.lock"],
-        &["svc/Cargo.lock"],
-        &Expect::exact(&[target("svc/core"), target("tools/audit")])
-            .require_command(CommandExpectation::new("svc", CommandMode::WorkspaceWide))
+        &["--files", "svc/Cargo.lock", "tools/helper/tests/smoke.rs"],
+        &["svc/Cargo.lock", "tools/helper/tests/smoke.rs"],
+        &Expect::exact(&[
+            target("svc/core"),
+            target("tools/audit"),
+            target("tools/helper"),
+        ])
+        .require_command(CommandExpectation::new("svc", CommandMode::WorkspaceWide))
+        .forbid_global_fail_wide(),
+    );
+}
+
+/// `helper/src/embed.rs` embeds the lockfile and `audit` mounts that file as
+/// a module without depending on `helper`. Only the file's owner was taken
+/// as its reader, so `audit` was left out.
+#[test]
+fn lockfile_change_selects_every_package_that_compiles_an_embedding_source() {
+    let monorepo = Monorepo::new(vec![
+        ws("svc")
+            .lockfile()
+            .package(pkg("core"))
+            .package(pkg("cli").dep("core"))
+            .package(pkg("helper").file(
+                "src/embed.rs",
+                "pub const LOCKFILE: &str = include_str!(\"../../Cargo.lock\");\n",
+            ))
+            .package(
+                pkg("audit").lib_source("#[path = \"../../helper/src/embed.rs\"]\nmod embed;\n"),
+            ),
+    ]);
+    let lockfile = rewind_locked_dependency(&monorepo, "svc", "cli", "core");
+    check(
+        "lockfile_change_selects_every_package_that_compiles_an_embedding_source",
+        monorepo,
+        &[edit("svc/Cargo.lock", &lockfile)],
+        &Expect::exact(&[target("svc/cli"), target("svc/helper"), target("svc/audit")])
+            .forbid_global_fail_wide(),
+    );
+}
+
+/// Sources outside `--root` are not indexed, so a package there that embeds
+/// the lockfile is unknown. Attributing `other`'s lockfile from a root that
+/// holds only `svc` narrowed `other` on an index that never read it.
+#[test]
+fn lockfile_of_a_workspace_outside_the_root_widens_that_workspace() {
+    let monorepo = Monorepo::new(vec![
+        ws("svc").package(pkg("core")),
+        ws("other")
+            .lockfile()
+            .package(pkg("lib"))
+            .package(pkg("app").dep("lib")),
+    ]);
+    let lockfile = rewind_locked_dependency(&monorepo, "other", "app", "lib");
+    let base = monorepo.commit("base");
+    monorepo.write("other/Cargo.lock", &lockfile);
+    let head = monorepo.commit("head");
+    check_selection_from(
+        "lockfile_of_a_workspace_outside_the_root_widens_that_workspace",
+        &monorepo,
+        "svc",
+        &["--base", &base, "--head", &head],
+        &["other/Cargo.lock"],
+        &Expect::exact(&[target("other/lib"), target("other/app")])
+            .require_command(CommandExpectation::new("other", CommandMode::WorkspaceWide))
             .forbid_global_fail_wide(),
     );
 }

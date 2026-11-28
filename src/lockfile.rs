@@ -242,7 +242,9 @@ fn package_key(entry: &Table) -> Option<PackageKey> {
 /// Resolve a dependency reference, written `name`, `name version`, or
 /// `name version (source)` with only as much detail as disambiguation needs.
 /// A reference names a Git source without the commit it is locked to, which
-/// the package's own `source` carries after `#`.
+/// the package's own `source` carries after `#`. A path package has no source
+/// to name, so a reference without one that still matches several packages
+/// means the path package among them.
 fn resolve_reference<'a>(
     keys_by_name: &BTreeMap<&str, Vec<&'a PackageKey>>,
     reference: &str,
@@ -254,15 +256,25 @@ fn resolve_reference<'a>(
         None => None,
         Some(source) => Some(source.strip_prefix('(')?.strip_suffix(')')?),
     };
-    let mut candidates = keys_by_name.get(name)?.iter().copied().filter(|key| {
-        version.is_none_or(|version| key.version == version)
-            && source.is_none_or(|source| {
-                key.source.as_deref().map(without_locked_commit)
-                    == Some(without_locked_commit(source))
-            })
-    });
-    let candidate = candidates.next()?;
-    candidates.next().is_none().then_some(candidate)
+    let mut candidates = keys_by_name
+        .get(name)?
+        .iter()
+        .copied()
+        .filter(|key| {
+            version.is_none_or(|version| key.version == version)
+                && source.is_none_or(|source| {
+                    key.source.as_deref().map(without_locked_commit)
+                        == Some(without_locked_commit(source))
+                })
+        })
+        .collect::<Vec<_>>();
+    if candidates.len() > 1 && source.is_none() {
+        candidates.retain(|key| key.source.is_none());
+    }
+    match candidates.as_slice() {
+        [candidate] => Some(candidate),
+        _ => None,
+    }
 }
 
 fn without_locked_commit(source: &str) -> &str {
@@ -414,6 +426,28 @@ mod tests {
         let change = lockfile_change(&workspace("aaa"), &workspace("bbb")).unwrap();
 
         assert_eq!(change.affected_path_packages, names(&["app"]));
+    }
+
+    #[test]
+    fn reference_without_a_source_means_the_path_package_of_that_name() {
+        // A registry `foo` shares the local `foo`'s name and version. Cargo
+        // qualifies the registry one and leaves the local one bare.
+        let registry_foo = format!("foo 0.1.0 ({REGISTRY})");
+        let workspace = |checksum: &str| {
+            lockfile(
+                4,
+                &[
+                    path_package("app", &["foo 0.1.0"]),
+                    path_package("foo", &[]),
+                    path_package("other", &[registry_foo.as_str()]),
+                    registry_package("foo", "0.1.0", checksum, &[]),
+                ],
+            )
+        };
+
+        let change = lockfile_change(&workspace("f1"), &workspace("f2")).unwrap();
+
+        assert_eq!(change.affected_path_packages, names(&["other"]));
     }
 
     #[test]

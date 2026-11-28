@@ -12,7 +12,7 @@ use crate::config::{ConfiguredInput, LitmusConfig, RuleSelection};
 use crate::error::Result;
 use crate::ferris::{AffectedCrate, AffectedWorkspace, FerrisAffectedReport, FerrisRunner};
 use crate::indexer::{IndexOptions, IndexSummary, build_or_update_index};
-use crate::lockfile::lockfile_change;
+use crate::lockfile::{LockfileChange, lockfile_change};
 use crate::model::{
     FileNode, INDEX_VERSION, IndexMetadata, ItemKind, ItemNode, PackageNode, SourceDependencyKind,
     SpanRange,
@@ -595,13 +595,12 @@ fn compute_affected_internal(
     } else {
         REASON_BUILD_FROM_FERRIS_WITH_UNCERTAINTY
     };
-    // An attributed lockfile selects packages for what they resolve, not for
-    // the paths that changed, so the narrowing below, which reasons from the
-    // owners of changed paths, would discard them.
-    let lockfile_attributed = lockfile_selections
-        .values()
-        .any(|selection| selection.is_ok());
-    let mut test_selection = if !lockfile_attributed
+    // A lockfile selects packages for what they resolve or embed, not for the
+    // paths that changed, so the narrowing below, which reasons from the
+    // owners of changed paths, would discard them. That holds whether or not
+    // the lockfile was attributed.
+    let lockfile_changed = !lockfile_selections.is_empty();
+    let mut test_selection = if !lockfile_changed
         && configured_inputs
             .iter()
             .all(|input| input.selection == RuleSelection::Ignore)
@@ -833,11 +832,9 @@ fn explain_inputs(
             }
             // A package that embeds the lockfile compiles its bytes, whatever
             // they resolve to and whether or not the change is attributed.
-            let mut readers = metadata
-                .source_dependencies
-                .iter()
-                .filter(|dependency| dependency.target_path == *path)
-                .filter_map(|dependency| package_for_path(metadata, &dependency.source_path))
+            let mut readers = sources_embedding(metadata, path)
+                .into_iter()
+                .filter_map(|source| package_for_path(metadata, source))
                 .map(|package| (package.id.clone(), package))
                 .collect::<BTreeMap<_, _>>();
             for reader in readers.values() {
@@ -867,7 +864,7 @@ fn explain_inputs(
                 path,
                 kind,
                 &reason,
-                package,
+                package.into_iter().chain(readers.values().copied()),
                 package.is_none(),
                 cargo_changes,
             ));
@@ -1412,6 +1409,12 @@ fn select_lockfile(
             workspace_path == workspace_root || (workspace_root.is_empty() && workspace_path == ".")
         })
         .ok_or("it is not at the root of an indexed workspace")?;
+    // Sources are indexed only beneath the analysis root, so the packages
+    // that embed the lockfile are known only when the root takes in the whole
+    // workspace.
+    if !analysis_root_contains(&options.root, repo_root, workspace_root) {
+        return Err("the analysis root does not contain its whole workspace".to_string());
+    }
     // The index assigns packages to workspaces by directory, so it does not
     // place a member that lives elsewhere in this workspace.
     let workspace_manifest = Path::new(workspace_root).join("Cargo.toml");
@@ -1425,12 +1428,12 @@ fn select_lockfile(
         }
         None => return Err("its workspace manifest is not readable".to_string()),
     }
-    // A source that embeds the lockfile but belongs to no package cannot be
-    // traced to the packages that compile it.
-    if metadata.source_dependencies.iter().any(|dependency| {
-        dependency.target_path == path
-            && package_for_path(metadata, &dependency.source_path).is_none()
-    }) {
+    // A source that embeds the lockfile but belongs to no package may be
+    // compiled by packages the index does not tie it to.
+    if sources_embedding(metadata, path)
+        .into_iter()
+        .any(|source| package_for_path(metadata, source).is_none())
+    {
         return Err("a source file outside every package embeds it".to_string());
     }
     let head = head.ok_or("it is missing from the working tree")?;
@@ -1475,7 +1478,7 @@ fn select_lockfile(
     }
     if reaches_package_indexed_elsewhere(
         &metadata.packages,
-        &workspace.name,
+        &workspace.path,
         workspace_root,
         &change.affected_path_packages,
     ) {
@@ -1485,20 +1488,7 @@ fn select_lockfile(
                 .to_string(),
         );
     }
-    let packages = metadata
-        .packages
-        .iter()
-        .filter(|package| {
-            package.workspace == workspace.name
-                && change.affected_path_packages.contains(&package.name)
-        })
-        .map(|package| {
-            (
-                package.id.clone(),
-                change.changed_path_packages.contains(&package.name),
-            )
-        })
-        .collect::<Vec<_>>();
+    let packages = members_reached(&metadata.packages, &workspace.path, &change);
     // Every locked package is in the closure of some workspace member, so a
     // change that reaches none of them was not understood.
     if packages.is_empty() && !change.changed_packages.is_empty() {
@@ -1508,6 +1498,55 @@ fn select_lockfile(
         packages,
         changed_packages: change.changed_packages,
     })
+}
+
+/// The indexed packages of the workspace at `workspace_path` that a lockfile
+/// change reaches, each flagged when its own locked entry changed. Workspaces
+/// are told apart by path, because two can share a name.
+fn members_reached(
+    packages: &[PackageNode],
+    workspace_path: &str,
+    change: &LockfileChange,
+) -> Vec<(String, bool)> {
+    packages
+        .iter()
+        .filter(|package| {
+            package.workspace_path == workspace_path
+                && change.affected_path_packages.contains(&package.name)
+        })
+        .map(|package| {
+            (
+                package.id.clone(),
+                change.changed_path_packages.contains(&package.name),
+            )
+        })
+        .collect()
+}
+
+/// Sources that embed `path`: those that include it, and in turn those that
+/// include such a source or mount it as a module. One source file can be
+/// compiled into several packages this way.
+fn sources_embedding<'a>(metadata: &'a IndexMetadata, path: &'a str) -> BTreeSet<&'a str> {
+    let mut sources = BTreeSet::new();
+    let mut pending = vec![path];
+    while let Some(target) = pending.pop() {
+        for dependency in &metadata.source_dependencies {
+            if dependency.target_path == target && sources.insert(dependency.source_path.as_str()) {
+                pending.push(&dependency.source_path);
+            }
+        }
+    }
+    sources
+}
+
+/// Whether the analysis root, a directory at or beneath the repository root,
+/// contains `directory`, given relative to the repository.
+fn analysis_root_contains(root: &Path, repo_root: &Path, directory: &str) -> bool {
+    let (Ok(root), Ok(repo_root)) = (root.canonicalize(), repo_root.canonicalize()) else {
+        return false;
+    };
+    root.strip_prefix(&repo_root)
+        .is_ok_and(|root| path_is_in_workspace(directory, &normalize_path(&root.to_string_lossy())))
 }
 
 /// Whether a workspace manifest lists a member that may lie outside the
@@ -1539,12 +1578,12 @@ fn workspace_lists_members_outside_its_directory(manifest: &str) -> Option<bool>
 /// one, which the index's directory-based assignment cannot show.
 fn reaches_package_indexed_elsewhere(
     packages: &[PackageNode],
-    workspace: &str,
+    workspace_path: &str,
     workspace_root: &str,
     affected_path_packages: &BTreeSet<String>,
 ) -> bool {
     packages.iter().any(|package| {
-        package.workspace != workspace
+        package.workspace_path != workspace_path
             && affected_path_packages.contains(&package.name)
             && path_is_in_workspace(&package.root_path, workspace_root)
     })
@@ -3843,18 +3882,10 @@ mod platform;
     /// lockfile's selection skipped it.
     #[test]
     fn lockfile_reaching_a_package_indexed_under_a_nested_workspace_is_detected() {
-        let package = |name: &str, workspace: &str, root_path: &str| PackageNode {
-            id: format!("path+{root_path}"),
-            name: name.to_string(),
-            workspace: workspace.to_string(),
-            workspace_path: String::new(),
-            manifest_path: format!("{root_path}/Cargo.toml"),
-            root_path: root_path.to_string(),
-        };
         let packages = [
-            package("app", "outer", "outer/app"),
-            package("member", "nested", "outer/nested/member"),
-            package("elsewhere", "other", "other/elsewhere"),
+            package_at("app", "outer", "outer/app"),
+            package_at("member", "outer/nested", "outer/nested/member"),
+            package_at("elsewhere", "other", "other/elsewhere"),
         ];
         let reaches = |names: &[&str]| {
             let affected = names.iter().map(ToString::to_string).collect();
@@ -3865,6 +3896,40 @@ mod platform;
         // A path dependency that lives in another workspace's directory is
         // tested against that workspace's lockfile.
         assert!(!reaches(&["app", "elsewhere"]));
+    }
+
+    /// `east/services` and `west/services` are both named `services`. Matching
+    /// members by workspace name selected the other workspace's `api` too, and
+    /// its test command could replace the right one.
+    #[test]
+    fn lockfile_selects_members_of_its_own_workspace_when_names_collide() {
+        let packages = [
+            package_at("api", "east/services", "east/services/api"),
+            package_at("api", "west/services", "west/services/api"),
+        ];
+        let change = LockfileChange {
+            affected_path_packages: BTreeSet::from(["api".to_string()]),
+            ..LockfileChange::default()
+        };
+
+        assert_eq!(
+            members_reached(&packages, "west/services", &change),
+            vec![("path+west/services/api".to_string(), false)]
+        );
+    }
+
+    /// A package whose workspace is named after the last directory of
+    /// `workspace_path`.
+    fn package_at(name: &str, workspace_path: &str, root_path: &str) -> PackageNode {
+        let workspace = workspace_path.rsplit('/').next().unwrap_or(workspace_path);
+        PackageNode {
+            id: format!("path+{root_path}"),
+            name: name.to_string(),
+            workspace: workspace.to_string(),
+            workspace_path: workspace_path.to_string(),
+            manifest_path: format!("{root_path}/Cargo.toml"),
+            root_path: root_path.to_string(),
+        }
     }
 
     #[test]
