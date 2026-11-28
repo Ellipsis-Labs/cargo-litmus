@@ -1,14 +1,18 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::changed_files::{ChangedFileInput, ChangedLineRange, merge_changed_file_inputs};
+use crate::changed_files::{
+    ChangeSource, ChangedFileInput, ChangedLineRange, file_at, merge_changed_file_inputs,
+    repository_root,
+};
 use crate::config::{ConfiguredInput, LitmusConfig, RuleSelection};
 use crate::error::Result;
 use crate::ferris::{AffectedCrate, AffectedWorkspace, FerrisAffectedReport, FerrisRunner};
 use crate::indexer::{IndexOptions, IndexSummary, build_or_update_index};
+use crate::lockfile::{LockfileChange, lockfile_change};
 use crate::model::{
     FileNode, INDEX_VERSION, IndexMetadata, ItemKind, ItemNode, PackageNode, SourceDependencyKind,
     SpanRange,
@@ -46,6 +50,11 @@ pub struct AffectedOptions {
     pub changed_files: Vec<ChangedFileInput>,
     pub base_cache: Option<PathBuf>,
     pub current_cache: Option<PathBuf>,
+    /// The Git change set the changes came from, when known. A changed
+    /// `Cargo.lock` is attributed to packages by comparing its copy at the
+    /// change set's base with the working tree's; without one, the lockfile
+    /// falls back to its owner.
+    pub change_source: Option<ChangeSource>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -346,6 +355,13 @@ fn compute_affected_internal(
         .unwrap_or(CacheStatus::NoBaseCache);
     let base_reference = base.as_ref().and_then(|base| base.reference.clone());
     let changed_file_inputs = selected_changed_file_inputs(options);
+    // Changed paths are relative to the repository, which `root` may be a
+    // subdirectory of.
+    let repo_root = repository_root(&options.root).unwrap_or_else(|_| options.root.clone());
+    // Read before indexing: `cargo metadata` may rewrite a lockfile that does
+    // not match its manifests, and that rewrite must not be mistaken for the
+    // change under test.
+    let lockfile_snapshots = snapshot_lockfiles(&repo_root, &changed_file_inputs);
     let current = match build_or_update_index(
         &IndexOptions {
             root: options.root.clone(),
@@ -419,15 +435,25 @@ fn compute_affected_internal(
     };
     let litmus_config = LitmusConfig::load_optional(&options.root)?;
     let configured_inputs = litmus_config.matches(selected_files.iter().cloned())?;
+    let lockfile_selections = select_lockfile_packages(
+        options,
+        &repo_root,
+        current_metadata,
+        &lockfile_snapshots,
+        &configured_inputs,
+    );
     // An inert file cannot affect a build or test, so it must not reach
     // ferris-wheel either: upstream widens on files it cannot map, which would
     // run workspaces no change can reach. An all-inert change selects nothing
-    // and skips the dependency walk entirely.
+    // and skips the dependency walk entirely. Attributed lockfiles stay out for
+    // the same reason: ferris-wheel selects every crate in a lockfile's
+    // workspace.
     let ferris_files = selected_files
         .iter()
         .filter(|path| {
             inert_input_reason(path, current_metadata, &litmus_config, &configured_inputs).is_none()
         })
+        .filter(|path| !matches!(lockfile_selections.get(*path), Some(Ok(_))))
         .cloned()
         .collect::<Vec<_>>();
     let mut ferris = if ferris_files.is_empty() {
@@ -456,6 +482,7 @@ fn compute_affected_internal(
         &changed_file_inputs,
         &configured_inputs,
         &litmus_config,
+        &lockfile_selections,
     );
     let mapped_paths = input_explanations
         .iter()
@@ -542,9 +569,15 @@ fn compute_affected_internal(
     } else {
         REASON_BUILD_FROM_FERRIS_WITH_UNCERTAINTY
     };
-    let mut test_selection = if configured_inputs
-        .iter()
-        .all(|input| input.selection == RuleSelection::Ignore)
+    // A lockfile selects packages for what they resolve or embed, not for the
+    // paths that changed, so the narrowing below, which reasons from the
+    // owners of changed paths, would discard them. That holds whether or not
+    // the lockfile was attributed.
+    let lockfile_changed = !lockfile_selections.is_empty();
+    let mut test_selection = if !lockfile_changed
+        && configured_inputs
+            .iter()
+            .all(|input| input.selection == RuleSelection::Ignore)
     {
         let ferris = exclude_test_only_dependents(current_metadata, &ferris, &diff);
         select_test_crates(
@@ -677,6 +710,7 @@ fn explain_inputs(
     changed_files: &[ChangedFileInput],
     configured_inputs: &[ConfiguredInput],
     config: &LitmusConfig,
+    lockfile_selections: &LockfileSelections,
 ) -> Vec<InputExplanation> {
     let indexed_paths = metadata
         .files
@@ -767,18 +801,45 @@ fn explain_inputs(
                 continue;
             }
             let package = package_for_path(metadata, path);
-            if let Some(package) = package {
-                insert_package_closure(metadata, ferris, &package.id);
+            // A package that embeds the lockfile compiles its bytes, whatever
+            // they resolve to and whether or not the change is attributed.
+            let readers = package
+                .into_iter()
+                .chain(
+                    sources_embedding(metadata, path)
+                        .into_iter()
+                        .filter_map(|source| package_for_path(metadata, source)),
+                )
+                .collect::<Vec<_>>();
+            for reader in &readers {
+                insert_package_closure(metadata, ferris, &reader.id);
             }
-            explanations.push(input_explanation_for_packages(
-                metadata,
-                path,
-                kind,
-                reason,
-                package,
-                package.is_none(),
+            let (reason, attributed, failed_wide) = match lockfile_selections.get(path) {
+                Some(Ok(selection)) => {
+                    let packages_by_id = package_by_id(metadata);
+                    for (package_id, directly_affected) in &selection.packages {
+                        if let Some(package) = packages_by_id.get(package_id) {
+                            insert_affected_package(ferris, package, *directly_affected);
+                        }
+                    }
+                    (
+                        lockfile_reason(selection),
+                        selection.packages.as_slice(),
+                        false,
+                    )
+                }
+                Some(Err(uncertainty)) => (
+                    format!("{reason}; {uncertainty}"),
+                    &[][..],
+                    package.is_none(),
+                ),
+                None => (reason.to_string(), &[][..], package.is_none()),
+            };
+            explanations.push(InputExplanation {
                 cargo_changes,
-            ));
+                failed_wide,
+                ..input_explanation_for_packages(metadata, path, kind, &reason, readers, attributed)
+            });
             continue;
         }
 
@@ -820,15 +881,17 @@ fn explain_inputs(
                 )
             };
             let failed_wide = packages.is_empty();
-            explanations.push(input_explanation_for_packages(
-                metadata,
-                path,
-                kind,
-                reason,
-                packages.into_values(),
+            explanations.push(InputExplanation {
                 failed_wide,
-                Vec::new(),
-            ));
+                ..input_explanation_for_packages(
+                    metadata,
+                    path,
+                    kind,
+                    reason,
+                    packages.into_values(),
+                    &[],
+                )
+            });
             continue;
         }
 
@@ -875,8 +938,7 @@ fn explain_inputs(
                 kind,
                 reason,
                 std::iter::once(package),
-                false,
-                Vec::new(),
+                &[],
             ));
             continue;
         }
@@ -1093,30 +1155,39 @@ fn manifest_change_kinds(
     kinds.into_iter().collect()
 }
 
+/// An explanation selecting `roots` and their reverse closures, plus each
+/// `attributed` package id without its closure, flagged when the input affects
+/// it directly. Dependency chains are traced from `roots` alone.
 fn input_explanation_for_packages<'a>(
     metadata: &IndexMetadata,
     path: &str,
     kind: InputKind,
     reason: &str,
-    direct_packages: impl IntoIterator<Item = &'a PackageNode>,
-    failed_wide: bool,
-    cargo_changes: Vec<CargoChangeKind>,
+    roots: impl IntoIterator<Item = &'a PackageNode>,
+    attributed: &[(String, bool)],
 ) -> InputExplanation {
-    let direct_ids = direct_packages
+    let root_ids = roots
         .into_iter()
         .map(|package| package.id.clone())
         .collect::<BTreeSet<_>>();
-    let selected_ids = direct_ids
+    let mut direct_ids = root_ids.clone();
+    let mut selected_ids = root_ids
         .iter()
         .flat_map(|id| reverse_package_closure(metadata, id))
         .collect::<BTreeSet<_>>();
+    for (package_id, directly_affected) in attributed {
+        selected_ids.insert(package_id.clone());
+        if *directly_affected {
+            direct_ids.insert(package_id.clone());
+        }
+    }
     let direct_packages = metadata
         .packages
         .iter()
         .filter(|package| direct_ids.contains(&package.id))
         .map(|package| package.name.clone())
         .collect();
-    let dependency_chains = reverse_dependency_chains(metadata, &direct_ids);
+    let dependency_chains = reverse_dependency_chains(metadata, &root_ids);
     let selected = metadata
         .packages
         .iter()
@@ -1132,14 +1203,14 @@ fn input_explanation_for_packages<'a>(
             .collect(),
         direct_packages,
         dependency_chains,
-        cargo_changes,
+        cargo_changes: Vec::new(),
         workspaces: selected
             .iter()
             .map(|package| package.workspace.clone())
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect(),
-        failed_wide,
+        failed_wide: false,
     }
 }
 
@@ -1202,33 +1273,313 @@ fn insert_package_closure(
         else {
             continue;
         };
-        let directly_affected = package.id == direct_package_id;
-        let affected = AffectedCrate {
-            name: package.name.clone(),
-            workspace: package.workspace.clone(),
-            is_directly_affected: directly_affected,
-            is_standalone: false,
-        };
-        if let Some(existing) = ferris
-            .affected_crates
-            .iter_mut()
-            .find(|krate| krate.name == affected.name && krate.workspace == affected.workspace)
-        {
-            existing.is_directly_affected |= directly_affected;
-        } else {
-            ferris.affected_crates.push(affected);
-        }
-        if directly_affected && !ferris.directly_affected_crates.contains(&package.name) {
-            ferris.directly_affected_crates.push(package.name.clone());
-        }
-        insert_affected_workspace(
-            ferris,
-            AffectedWorkspace {
-                name: package.workspace.clone(),
-                path: package.workspace_path.clone(),
-            },
-        );
+        insert_affected_package(ferris, package, package.id == direct_package_id);
     }
+}
+
+fn insert_affected_package(
+    ferris: &mut FerrisAffectedReport,
+    package: &PackageNode,
+    directly_affected: bool,
+) {
+    let affected = AffectedCrate {
+        name: package.name.clone(),
+        workspace: package.workspace.clone(),
+        is_directly_affected: directly_affected,
+        is_standalone: false,
+    };
+    if let Some(existing) = ferris
+        .affected_crates
+        .iter_mut()
+        .find(|krate| krate.name == affected.name && krate.workspace == affected.workspace)
+    {
+        existing.is_directly_affected |= directly_affected;
+    } else {
+        ferris.affected_crates.push(affected);
+    }
+    if directly_affected && !ferris.directly_affected_crates.contains(&package.name) {
+        ferris.directly_affected_crates.push(package.name.clone());
+    }
+    insert_affected_workspace(
+        ferris,
+        AffectedWorkspace {
+            name: package.workspace.clone(),
+            path: package.workspace_path.clone(),
+        },
+    );
+}
+
+/// Changed lockfiles, by path, mapped to the workspace packages a comparison
+/// with the base revision attributes them to, or to the reason none could be
+/// made.
+type LockfileSelections = BTreeMap<String, std::result::Result<LockfileSelection, String>>;
+
+#[derive(Clone, Debug)]
+struct LockfileSelection {
+    /// Package ids in the lockfile's workspace whose locked dependency closure
+    /// contains a changed package, each flagged when its own locked entry
+    /// changed. The lockfile graph already closes this set over the
+    /// workspace's reverse dependencies.
+    packages: Vec<(String, bool)>,
+    changed_packages: BTreeSet<String>,
+}
+
+fn snapshot_lockfiles(
+    root: &Path,
+    changed_files: &[ChangedFileInput],
+) -> BTreeMap<String, Option<String>> {
+    changed_files
+        .iter()
+        .filter(|file| {
+            matches!(
+                cargo_input_kind(&file.path),
+                Some((InputKind::CargoLock, _))
+            )
+        })
+        .map(|file| {
+            (
+                file.path.clone(),
+                fs::read_to_string(root.join(&file.path)).ok(),
+            )
+        })
+        .collect()
+}
+
+fn select_lockfile_packages(
+    options: &AffectedOptions,
+    repo_root: &Path,
+    metadata: &IndexMetadata,
+    snapshots: &BTreeMap<String, Option<String>>,
+    configured_inputs: &[ConfiguredInput],
+) -> LockfileSelections {
+    snapshots
+        .iter()
+        .filter(|(path, _)| !configured_inputs.iter().any(|input| input.path == **path))
+        .map(|(path, head)| {
+            (
+                path.clone(),
+                select_lockfile(options, repo_root, metadata, path, head.as_deref()),
+            )
+        })
+        .collect()
+}
+
+/// A lockfile only governs builds of its own workspace: other workspaces
+/// compile the same path packages against their own lockfiles. So a
+/// lockfile change selects members of that workspace and nothing beyond it.
+fn select_lockfile(
+    options: &AffectedOptions,
+    repo_root: &Path,
+    metadata: &IndexMetadata,
+    path: &str,
+    head: Option<&str>,
+) -> std::result::Result<LockfileSelection, String> {
+    // `cargo_input_kind` matches any name ending in `Cargo.lock`.
+    let workspace_root = if path == "Cargo.lock" {
+        ""
+    } else {
+        path.strip_suffix("/Cargo.lock")
+            .ok_or("it is not named Cargo.lock")?
+    };
+    let workspace = indexed_workspaces(metadata)
+        .into_iter()
+        .find(|workspace| {
+            let workspace_path = repo_relative_workspace_path(&options.root, &workspace.path);
+            workspace_path == workspace_root || (workspace_root.is_empty() && workspace_path == ".")
+        })
+        .ok_or("it is not at the root of an indexed workspace")?;
+    // Sources are indexed only beneath the analysis root, so the packages
+    // that embed the lockfile are known only when the root takes in the whole
+    // workspace.
+    if !analysis_root_contains(&options.root, repo_root, workspace_root) {
+        return Err("the analysis root does not contain its whole workspace".to_string());
+    }
+    // The index assigns packages to workspaces by directory, so it does not
+    // place a member that lives elsewhere in this workspace.
+    let workspace_manifest = Path::new(workspace_root).join("Cargo.toml");
+    match fs::read_to_string(repo_root.join(workspace_manifest))
+        .ok()
+        .and_then(|manifest| workspace_lists_members_outside_its_directory(&manifest))
+    {
+        Some(false) => {}
+        Some(true) => {
+            return Err("its workspace has members outside the workspace directory".to_string());
+        }
+        None => return Err("its workspace manifest is not readable".to_string()),
+    }
+    // A source that embeds the lockfile but belongs to no package may be
+    // compiled by packages the index does not tie it to.
+    if sources_embedding(metadata, path)
+        .into_iter()
+        .any(|source| package_for_path(metadata, source).is_none())
+    {
+        return Err("a source file outside every package embeds it".to_string());
+    }
+    let head = head.ok_or("it is missing from the working tree")?;
+    if fs::read_to_string(repo_root.join(path)).ok().as_deref() != Some(head) {
+        return Err("it changed on disk while the index was built".to_string());
+    }
+    // Selected tests build the working tree, so its copy must be the one the
+    // measured change ends at: an uncommitted or unstaged rewrite cannot
+    // stand in for it.
+    let mut heads = vec![head.to_string()];
+    let base_revision = match &options.change_source {
+        Some(ChangeSource::Worktree) => "HEAD",
+        Some(ChangeSource::Staged) => {
+            if file_at(repo_root, None, path).as_deref() != Some(head) {
+                return Err("the working-tree copy differs from the staged copy".to_string());
+            }
+            "HEAD"
+        }
+        Some(
+            ChangeSource::Revisions {
+                base,
+                head: revision,
+            }
+            | ChangeSource::MergeBase {
+                base,
+                head: revision,
+                ..
+            },
+        ) => {
+            if file_at(repo_root, Some("HEAD"), path).as_deref() != Some(head) {
+                return Err("the working-tree copy differs from the checked-out HEAD".to_string());
+            }
+            // The checkout may differ from the named head (CI commonly tests
+            // a merge commit while naming the pull request's head), in which
+            // case the lockfile is attributed for both.
+            let requested = file_at(repo_root, Some(revision), path)
+                .ok_or("the head revision has no readable copy")?;
+            if requested != head {
+                heads.push(requested);
+            }
+            base
+        }
+        _ => return Err("no base revision was given to compare it with".to_string()),
+    };
+    let base = file_at(repo_root, Some(base_revision), path)
+        .ok_or("the base revision has no readable copy")?;
+    // A lockfile named as changed that is the same over the range was not
+    // changed by what the range measures, so the range cannot explain it.
+    if heads.iter().all(|head| *head == base) {
+        return Err("it does not differ from the base revision".to_string());
+    }
+    let mut change = LockfileChange::default();
+    for head in &heads {
+        change.merge(lockfile_change(&base, head).map_err(|uncertainty| uncertainty.to_string())?);
+    }
+    let packages = members_reached(&metadata.packages, &workspace.path, workspace_root, &change)?;
+    // Every locked package is in the closure of some workspace member, so a
+    // change that reaches none of them was not understood.
+    if packages.is_empty() && !change.changed_packages.is_empty() {
+        return Err("its changes reach no indexed member of its workspace".to_string());
+    }
+    Ok(LockfileSelection {
+        packages,
+        changed_packages: change.changed_packages,
+    })
+}
+
+/// The indexed packages of the workspace at `workspace_path` that a lockfile
+/// change reaches, each flagged when its own locked entry changed. Workspaces
+/// are told apart by path, because two can share a name. Fails when the
+/// change reaches a package beneath `workspace_root` that the index files
+/// under another workspace: a nested workspace can exclude such a package and
+/// leave it a member of the outer one, which the index's directory-based
+/// assignment cannot show.
+fn members_reached(
+    packages: &[PackageNode],
+    workspace_path: &str,
+    workspace_root: &str,
+    change: &LockfileChange,
+) -> std::result::Result<Vec<(String, bool)>, String> {
+    let mut members = Vec::new();
+    for package in packages
+        .iter()
+        .filter(|package| change.affected_path_packages.contains(&package.name))
+    {
+        if package.workspace_path == workspace_path {
+            let changed = change.changed_path_packages.contains(&package.name);
+            members.push((package.id.clone(), changed));
+        } else if path_is_in_workspace(&package.root_path, workspace_root) {
+            return Err(
+                "it reaches a package beneath its workspace directory that is indexed under \
+                 another workspace"
+                    .to_string(),
+            );
+        }
+    }
+    Ok(members)
+}
+
+/// Sources that embed `path`: those that include it, and in turn those that
+/// include such a source or mount it as a module. One source file can be
+/// compiled into several packages this way.
+fn sources_embedding<'a>(metadata: &'a IndexMetadata, path: &'a str) -> BTreeSet<&'a str> {
+    let mut sources = BTreeSet::new();
+    let mut pending = vec![path];
+    while let Some(target) = pending.pop() {
+        for dependency in &metadata.source_dependencies {
+            if dependency.target_path == target && sources.insert(dependency.source_path.as_str()) {
+                pending.push(&dependency.source_path);
+            }
+        }
+    }
+    sources
+}
+
+/// Whether the analysis root, a directory at or beneath the repository root,
+/// contains `directory`, given relative to the repository.
+fn analysis_root_contains(root: &Path, repo_root: &Path, directory: &str) -> bool {
+    let (Ok(root), Ok(repo_root)) = (root.canonicalize(), repo_root.canonicalize()) else {
+        return false;
+    };
+    root.strip_prefix(&repo_root)
+        .is_ok_and(|root| path_is_in_workspace(directory, &normalize_path(&root.to_string_lossy())))
+}
+
+/// Whether a workspace manifest lists a member that may lie outside the
+/// manifest's directory. Returns `None` when the manifest does not parse. A
+/// package can only join a workspace from outside its directory by being
+/// listed, so the member list is the whole answer. Any `..` counts, wherever
+/// it appears: after a glob it can no longer be resolved by reading the
+/// pattern.
+fn workspace_lists_members_outside_its_directory(manifest: &str) -> Option<bool> {
+    let manifest = toml::from_str::<toml::Table>(manifest).ok()?;
+    let Some(members) = manifest
+        .get("workspace")
+        .and_then(|workspace| workspace.get("members"))
+    else {
+        return Some(false);
+    };
+    let mut outside = false;
+    for member in members.as_array()? {
+        outside |= Path::new(member.as_str()?)
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_) | Component::CurDir));
+    }
+    Some(outside)
+}
+
+fn lockfile_reason(selection: &LockfileSelection) -> String {
+    const LISTED_CHANGES: usize = 10;
+    let changed = &selection.changed_packages;
+    if changed.is_empty() {
+        return "lockfile changes leave every locked package as it was".to_string();
+    }
+    let mut listed = changed
+        .iter()
+        .take(LISTED_CHANGES)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if changed.len() > LISTED_CHANGES {
+        listed.push_str(&format!(", and {} more", changed.len() - LISTED_CHANGES));
+    }
+    format!(
+        "lockfile changes ({listed}) select the workspace packages whose locked dependency \
+         closure contains a changed package"
+    )
 }
 
 fn insert_affected_workspace(ferris: &mut FerrisAffectedReport, workspace: AffectedWorkspace) {
@@ -1741,7 +2092,7 @@ fn select_test_crates_with_configured_inputs(
     diff: &DiffResult,
     workspace_uncertainty: &BTreeMap<String, Vec<String>>,
     changed_file_inputs: &[ChangedFileInput],
-    has_configured_inputs: bool,
+    keep_ferris_selection: bool,
 ) -> TestSelection {
     let known_changed_paths = diff
         .changed_files
@@ -1766,7 +2117,7 @@ fn select_test_crates_with_configured_inputs(
         .map(|package| package.id.clone())
         .collect::<BTreeSet<_>>();
     let changed_production_packages = changed_production_package_ids(metadata, diff);
-    if has_configured_inputs {
+    if keep_ferris_selection {
         return TestSelection::from_ferris(
             ferris,
             REASON_TEST_FERRIS_DAG,
@@ -3244,6 +3595,7 @@ mod platform;
                 }],
                 &[],
                 &LitmusConfig::default(),
+                &LockfileSelections::new(),
             );
 
             assert_eq!(explanations.len(), 1);
@@ -3409,6 +3761,77 @@ mod platform;
         AffectedWorkspace {
             name: name.to_string(),
             path: name.to_string(),
+        }
+    }
+
+    /// The index files a member outside the workspace directory under another
+    /// workspace, so such a member must be detected.
+    #[test]
+    fn workspace_member_outside_the_workspace_directory_is_detected() {
+        let detect = workspace_lists_members_outside_its_directory;
+        assert_eq!(
+            detect("[workspace]\nmembers = [\"api\", \"../foo\"]\n"),
+            Some(true)
+        );
+        // `**` can match nothing, which leaves `../outside`.
+        assert_eq!(
+            detect("[workspace]\nmembers = [\"**/../outside\"]\n"),
+            Some(true)
+        );
+        assert_eq!(
+            detect("[workspace]\nmembers = [\"api\", \"./crates/*\"]\n"),
+            Some(false)
+        );
+    }
+
+    /// A lockfile selects only members of its own workspace, told apart by
+    /// path because two workspaces can share a name, and fails when it reaches
+    /// a package beneath its directory that the index files under a nested
+    /// workspace.
+    #[test]
+    fn lockfile_selects_only_members_of_its_own_workspace() {
+        let packages = [
+            package_at("api", "east/services", "east/services/api"),
+            package_at("api", "west/services", "west/services/api"),
+            package_at(
+                "member",
+                "west/services/nested",
+                "west/services/nested/member",
+            ),
+            package_at("elsewhere", "other", "other/elsewhere"),
+        ];
+        let reached = |names: &[&str]| {
+            let change = LockfileChange {
+                affected_path_packages: names.iter().map(ToString::to_string).collect(),
+                ..LockfileChange::default()
+            };
+            members_reached(&packages, "west/services", "west/services", &change)
+        };
+
+        assert_eq!(
+            reached(&["api"]),
+            Ok(vec![("path+west/services/api".to_string(), false)])
+        );
+        // A path dependency in another workspace's directory is tested
+        // against that workspace's lockfile.
+        assert_eq!(
+            reached(&["api", "elsewhere"]),
+            Ok(vec![("path+west/services/api".to_string(), false)])
+        );
+        assert!(reached(&["api", "member"]).is_err());
+    }
+
+    /// A package whose workspace is named after the last directory of
+    /// `workspace_path`.
+    fn package_at(name: &str, workspace_path: &str, root_path: &str) -> PackageNode {
+        let workspace = workspace_path.rsplit('/').next().unwrap_or(workspace_path);
+        PackageNode {
+            id: format!("path+{root_path}"),
+            name: name.to_string(),
+            workspace: workspace.to_string(),
+            workspace_path: workspace_path.to_string(),
+            manifest_path: format!("{root_path}/Cargo.toml"),
+            root_path: root_path.to_string(),
         }
     }
 
@@ -4179,6 +4602,7 @@ mod platform;
                 changed_files: Vec::new(),
                 base_cache: None,
                 current_cache: None,
+                change_source: None,
             },
             &[AffectedWorkspace {
                 name: "nodes".to_string(),

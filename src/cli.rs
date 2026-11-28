@@ -9,7 +9,7 @@ use crate::affected::{
     AffectedOptions, AffectedReport, compute_affected, compute_affected_validated,
 };
 use crate::changed_files::{
-    ChangeSet, ChangedFileInput, merge_changed_file_inputs, parse_changed_file_inputs,
+    ChangeSet, ChangeSource, ChangedFileInput, merge_changed_file_inputs, parse_changed_file_inputs,
 };
 use crate::error::{LitmusError, Result};
 use crate::explain::ExplainReport;
@@ -198,7 +198,10 @@ pub fn execute(cli: Cli) -> Result<()> {
             format,
             json_output,
         } => {
-            let changed_files = collect_changed_files(ChangeInputOptions {
+            let ChangeInputs {
+                files: changed_files,
+                source: change_source,
+            } = collect_changed_files(ChangeInputOptions {
                 root: &root,
                 files,
                 files_stdin,
@@ -214,6 +217,7 @@ pub fn execute(cli: Cli) -> Result<()> {
                 changed_files,
                 base_cache: base_cache.or_else(default_base_cache),
                 current_cache,
+                change_source,
             };
             let report = if validate_nextest {
                 compute_affected_validated(&options, &CommandFerrisRunner)?
@@ -245,6 +249,7 @@ pub fn execute(cli: Cli) -> Result<()> {
                     changed_files: vec![ChangedFileInput::path_only(path.clone())],
                     base_cache: None,
                     current_cache,
+                    change_source: None,
                 };
                 let affected = if validate_nextest {
                     compute_affected_validated(&options, &CommandFerrisRunner)?
@@ -316,7 +321,13 @@ struct ChangeInputOptions<'a> {
     staged: bool,
 }
 
-fn collect_changed_files(options: ChangeInputOptions<'_>) -> Result<Vec<ChangedFileInput>> {
+/// Changed files plus the Git change set they came from, when there is one.
+struct ChangeInputs {
+    files: Vec<ChangedFileInput>,
+    source: Option<ChangeSource>,
+}
+
+fn collect_changed_files(options: ChangeInputOptions<'_>) -> Result<ChangeInputs> {
     let ChangeInputOptions {
         root,
         files,
@@ -337,18 +348,30 @@ fn collect_changed_files(options: ChangeInputOptions<'_>) -> Result<Vec<ChangedF
             .map_err(|source| crate::error::LitmusError::io("stdin", source))?;
         changed_files.extend(parse_changed_file_inputs(&raw));
     }
-    if let (Some(base_rev), Some(head_rev)) = (base_rev, head_rev) {
-        let revision_files = ChangeSet::revisions(root, &base_rev, &head_rev)?.files;
-        changed_files = merge_revision_changed_files(changed_files, revision_files);
+    let change_set = if let (Some(base_rev), Some(head_rev)) = (base_rev, head_rev) {
+        Some(ChangeSet::revisions(root, &base_rev, &head_rev)?)
     } else if let Some(upstream) = merge_base {
-        changed_files.extend(ChangeSet::merge_base(root, &upstream)?.files);
+        Some(ChangeSet::merge_base(root, &upstream)?)
     } else if worktree {
-        changed_files.extend(ChangeSet::worktree(root)?.files);
+        Some(ChangeSet::worktree(root)?)
     } else if staged {
-        changed_files.extend(ChangeSet::staged(root)?.files);
-    }
+        Some(ChangeSet::staged(root)?)
+    } else {
+        None
+    };
+    let source = change_set.map(|ChangeSet { source, files }| {
+        if matches!(source, ChangeSource::Revisions { .. }) {
+            changed_files = merge_revision_changed_files(std::mem::take(&mut changed_files), files);
+        } else {
+            changed_files.extend(files);
+        }
+        source
+    });
 
-    Ok(merge_changed_file_inputs(changed_files))
+    Ok(ChangeInputs {
+        files: merge_changed_file_inputs(changed_files),
+        source,
+    })
 }
 
 fn merge_revision_changed_files(

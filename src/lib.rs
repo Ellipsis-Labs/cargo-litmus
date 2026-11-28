@@ -36,6 +36,7 @@
 //!         changed_files: changes.files,
 //!         base_cache: None,
 //!         current_cache: None,
+//!         change_source: Some(changes.source),
 //!     },
 //!     &CommandFerrisRunner,
 //! )?;
@@ -57,6 +58,7 @@ pub mod explain;
 pub mod ferris;
 pub mod indexer;
 pub mod inert;
+pub mod lockfile;
 pub mod model;
 pub mod nextest;
 pub mod parser;

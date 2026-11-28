@@ -100,6 +100,43 @@ pub fn check_with_wrapped_cargo(
     )
 }
 
+/// Runs `affected` from `root`, a directory relative to the repository, with
+/// the given change-selection arguments against the repository as it stands,
+/// for scenarios whose checkout is not the head of the change being measured.
+/// `changed_paths` scripts ferris-wheel.
+pub fn check_selection(
+    name: &str,
+    monorepo: &Monorepo,
+    root: &str,
+    selection: &[&str],
+    changed_paths: &[&str],
+    expect: &Expect,
+) -> Report {
+    let scratch = TempDir::new().expect("scratch dir");
+    let current_cache = scratch.path().join("current.rkyv");
+    let bin_dir = ferris_shim_dir(scratch.path());
+    let changed_paths = changed_paths
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    write_ferris_shim(
+        &bin_dir,
+        &ferris_payload(monorepo, &changed_paths),
+        &lineup_payload(monorepo),
+    );
+
+    let mut args = selection.to_vec();
+    args.extend(["--current-cache", current_cache.to_str().expect("utf8")]);
+    run_affected(
+        name,
+        monorepo,
+        &monorepo.canonical_root().join(root),
+        &bin_dir,
+        &args,
+        expect,
+    )
+}
+
 #[derive(Default)]
 struct RunOptions {
     ferris_override: Option<FerrisPayload>,
@@ -119,8 +156,9 @@ fn run_scenario(
     let current_cache = scratch.path().join("current.rkyv");
     let bin_dir = ferris_shim_dir(scratch.path());
 
+    let root = monorepo.canonical_root();
     let base_output = run_litmus(
-        &monorepo,
+        &root,
         &bin_dir,
         &["index", "--cache", base_cache.to_str().expect("utf8")],
     );
@@ -141,11 +179,12 @@ fn run_scenario(
         write_cargo_wrapper(&bin_dir);
     }
 
-    let output = run_litmus(
+    run_affected(
+        name,
         &monorepo,
+        &root,
         &bin_dir,
         &[
-            "affected",
             "--base",
             &base,
             "--head",
@@ -154,10 +193,23 @@ fn run_scenario(
             base_cache.to_str().expect("utf8"),
             "--current-cache",
             current_cache.to_str().expect("utf8"),
-            "--format",
-            "json",
         ],
-    );
+        expect,
+    )
+}
+
+fn run_affected(
+    name: &str,
+    monorepo: &Monorepo,
+    root: &Path,
+    bin_dir: &Path,
+    args: &[&str],
+    expect: &Expect,
+) -> Report {
+    let mut command = vec!["affected"];
+    command.extend(args);
+    command.extend(["--format", "json"]);
+    let output = run_litmus(root, bin_dir, &command);
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     assert!(
@@ -170,7 +222,7 @@ fn run_scenario(
         panic!("scenario {name}: report is not valid JSON: {error}\n{stdout}")
     });
 
-    assert_expectations(name, &monorepo, &report, expect);
+    assert_expectations(name, monorepo, &report, expect);
     report
 }
 
@@ -196,13 +248,12 @@ fn apply_changes(monorepo: &Monorepo, changes: &[Change]) -> Vec<String> {
     paths
 }
 
-fn run_litmus(monorepo: &Monorepo, bin_dir: &Path, args: &[&str]) -> std::process::Output {
-    let root = monorepo.canonical_root();
+fn run_litmus(root: &Path, bin_dir: &Path, args: &[&str]) -> std::process::Output {
     Command::new(litmus_binary())
         .args(args)
         .arg("--root")
-        .arg(&root)
-        .current_dir(&root)
+        .arg(root)
+        .current_dir(root)
         .env("PATH", sanitized_path(bin_dir))
         .env_remove("LITMUS_BASE_CACHE")
         .env_remove("CARGO_TARGET_DIR")

@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use git2::{Delta, Diff, DiffFindOptions, DiffOptions, ObjectType, Oid, Repository, Tree};
 use serde::{Deserialize, Serialize};
@@ -177,6 +177,38 @@ pub fn changed_file_inputs_from_revs(
     head_rev: &str,
 ) -> Result<Vec<ChangedFileInput>> {
     Ok(ChangeSet::revisions(root, base_rev, head_rev)?.files)
+}
+
+/// The working directory of the repository that contains `root`. Changed
+/// paths are relative to it, whichever subdirectory `root` names.
+pub fn repository_root(root: &Path) -> Result<PathBuf> {
+    Ok(open_repository(root)?
+        .workdir()
+        .ok_or(LitmusError::BareRepo)?
+        .to_path_buf())
+}
+
+/// Read a UTF-8 file from the repository that contains `root`, as committed
+/// at `revision`, or as staged in the index when `revision` is `None`. `path`
+/// is relative to the repository's working directory. Returns `None` when the
+/// file cannot be read there, is held in a merge conflict, or is not valid
+/// UTF-8.
+pub fn file_at(root: &Path, revision: Option<&str>, path: &str) -> Option<String> {
+    let repo = open_repository(root).ok()?;
+    let blob = match revision {
+        Some(revision) => revision_tree(&repo, revision)
+            .ok()?
+            .get_path(Path::new(path))
+            .ok()?
+            .to_object(&repo)
+            .ok()?
+            .peel_to_blob()
+            .ok()?,
+        None => repo
+            .find_blob(repo.index().ok()?.get_path(Path::new(path), 0)?.id)
+            .ok()?,
+    };
+    std::str::from_utf8(blob.content()).ok().map(str::to_string)
 }
 
 fn open_repository(root: &Path) -> Result<Repository> {

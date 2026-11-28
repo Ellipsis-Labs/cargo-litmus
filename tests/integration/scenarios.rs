@@ -17,8 +17,8 @@ use std::fs;
 
 use crate::support::{
     CommandExpectation, CommandMode, Expect, FerrisCrate, FerrisPayload, FerrisWorkspace, Monorepo,
-    check, check_with_ferris, check_with_wrapped_cargo, create, delete, edit, pkg, rename, target,
-    ws,
+    check, check_selection, check_with_ferris, check_with_wrapped_cargo, create, delete, edit, pkg,
+    rename, target, ws,
 };
 
 #[test]
@@ -394,10 +394,380 @@ fn workspace_lockfile_change_widens_only_its_own_workspace() {
             .require_command(CommandExpectation::new("sdk", CommandMode::WorkspaceWide))
             .forbid_global_fail_wide()
             .note(
-                "a workspace lockfile has no owning package; widening must stay in that workspace",
+                "the edited lockfile disagrees with its manifests, so cargo rewrites it and it \
+                 cannot be attributed; widening must stay in that workspace",
             ),
         Some(payload),
     );
+}
+
+/// The lockfile records the new edge from `cli` to `core`; comparing it with
+/// the base lockfile attributes the change to `cli` alone instead of widening
+/// the workspace, and `core`'s other dependent stays unselected.
+#[test]
+fn workspace_lockfile_change_selects_only_members_whose_resolution_changed() {
+    let monorepo = Monorepo::new(vec![
+        ws("svc")
+            .lockfile()
+            .package(pkg("core"))
+            .package(pkg("api").dep("core"))
+            .package(pkg("cli")),
+    ]);
+    let manifest =
+        fs::read_to_string(monorepo.root().join("svc/cli/Cargo.toml")).expect("read manifest");
+    let lockfile =
+        fs::read_to_string(monorepo.root().join("svc/Cargo.lock")).expect("read lockfile");
+    check(
+        "workspace_lockfile_change_selects_only_members_whose_resolution_changed",
+        monorepo,
+        &[
+            edit(
+                "svc/cli/Cargo.toml",
+                &format!("{manifest}\n[dependencies]\ncore = {{ path = \"../core\" }}\n"),
+            ),
+            edit(
+                "svc/Cargo.lock",
+                &with_locked_dependency(&lockfile, "cli", "core"),
+            ),
+        ],
+        &Expect::exact(&[target("svc/cli")])
+            .require_command(CommandExpectation::new("svc", CommandMode::Package).package("cli"))
+            .forbid_global_fail_wide()
+            .note("only cli's locked dependency list changed"),
+    );
+}
+
+/// Commits `workspace`'s lockfile without `package`'s edge to `dependency` and
+/// returns the authoritative copy. Committing that copy afterwards is a change
+/// to the lockfile alone that the manifests agree with, so cargo leaves it be.
+fn rewind_locked_dependency(
+    monorepo: &Monorepo,
+    workspace: &str,
+    package: &str,
+    dependency: &str,
+) -> String {
+    let path = format!("{workspace}/Cargo.lock");
+    let lockfile = fs::read_to_string(monorepo.root().join(&path)).expect("read lockfile");
+    let (entry, locked) = locked_edge(package, dependency);
+    assert!(lockfile.contains(&locked), "{lockfile}");
+    monorepo.write(&path, &lockfile.replace(&locked, &entry));
+    lockfile
+}
+
+/// A test-only edit in `tool` does not narrow selection to the owners of
+/// changed paths, which would drop `cli`, the lockfile's attributed member.
+#[test]
+fn lockfile_selection_survives_a_test_only_edit_in_another_package() {
+    let monorepo = Monorepo::new(vec![
+        ws("svc")
+            .lockfile()
+            .package(pkg("core"))
+            .package(pkg("cli").dep("core"))
+            .package(pkg("tool").file("tests/smoke.rs", "#[test]\nfn smoke() {}\n")),
+    ]);
+    let lockfile = rewind_locked_dependency(&monorepo, "svc", "cli", "core");
+    check(
+        "lockfile_selection_survives_a_test_only_edit_in_another_package",
+        monorepo,
+        &[
+            edit("svc/Cargo.lock", &lockfile),
+            edit(
+                "svc/tool/tests/smoke.rs",
+                "#[test]\nfn smoke() {\n    assert_eq!(1, 1);\n}\n",
+            ),
+        ],
+        &Expect::exact(&[target("svc/cli"), target("svc/tool")]).forbid_global_fail_wide(),
+    );
+}
+
+/// Pruning the dependents of a package with only test edits keeps `api`,
+/// which the lockfile reaches through `core`.
+#[test]
+fn lockfile_selection_survives_pruning_of_test_only_dependents() {
+    let monorepo = Monorepo::new(vec![
+        ws("svc")
+            .lockfile()
+            .package(pkg("util"))
+            .package(
+                pkg("core")
+                    .dep("util")
+                    .file("tests/it.rs", "#[test]\nfn core_works() {}\n"),
+            )
+            .package(pkg("api").dep("core"))
+            .package(pkg("worker")),
+    ]);
+    let lockfile = rewind_locked_dependency(&monorepo, "svc", "core", "util");
+    check(
+        "lockfile_selection_survives_pruning_of_test_only_dependents",
+        monorepo,
+        &[
+            edit("svc/Cargo.lock", &lockfile),
+            edit(
+                "svc/core/tests/it.rs",
+                "#[test]\nfn core_works() {\n    assert_eq!(1, 1);\n}\n",
+            ),
+            edit("svc/worker/src/lib.rs", "pub fn worker() -> u32 { 2 }\n"),
+        ],
+        &Expect::exact(&[target("svc/core"), target("svc/api"), target("svc/worker")])
+            .forbid_global_fail_wide(),
+    );
+}
+
+/// `audit` compiles the lockfile's bytes, so it is affected by a change that
+/// resolves nothing differently for it.
+#[test]
+fn lockfile_change_selects_a_package_that_embeds_the_lockfile() {
+    let monorepo = Monorepo::new(vec![
+        ws("svc")
+            .lockfile()
+            .package(pkg("core"))
+            .package(pkg("cli").dep("core"))
+            .package(
+                pkg("audit")
+                    .lib_source("pub const LOCKFILE: &str = include_str!(\"../../Cargo.lock\");\n"),
+            ),
+    ]);
+    let lockfile = rewind_locked_dependency(&monorepo, "svc", "cli", "core");
+    check(
+        "lockfile_change_selects_a_package_that_embeds_the_lockfile",
+        monorepo,
+        &[edit("svc/Cargo.lock", &lockfile)],
+        &Expect::exact(&[target("svc/cli"), target("svc/audit")]).forbid_global_fail_wide(),
+    );
+}
+
+/// `--staged` measures the index, but the selected tests build the working
+/// tree, so a staged lockfile that differs from it cannot be attributed.
+#[test]
+fn staged_lockfile_that_differs_from_the_working_tree_widens_its_workspace() {
+    let monorepo = Monorepo::new(vec![
+        ws("svc")
+            .lockfile()
+            .package(pkg("core"))
+            .package(pkg("cli")),
+    ]);
+    monorepo.commit("base");
+    let lockfile =
+        fs::read_to_string(monorepo.root().join("svc/Cargo.lock")).expect("read lockfile");
+    monorepo.write(
+        "svc/Cargo.lock",
+        &with_locked_dependency(&lockfile, "cli", "core"),
+    );
+    monorepo.stage("svc/Cargo.lock");
+    monorepo.write("svc/Cargo.lock", &lockfile);
+    check_selection(
+        "staged_lockfile_that_differs_from_the_working_tree_widens_its_workspace",
+        &monorepo,
+        "",
+        &["--staged"],
+        &["svc/Cargo.lock"],
+        &Expect::exact(&[target("svc/core"), target("svc/cli")])
+            .require_command(CommandExpectation::new("svc", CommandMode::WorkspaceWide))
+            .forbid_global_fail_wide(),
+    );
+}
+
+/// A lockfile change at the `--head` revision is attributed even when the
+/// checkout no longer has it.
+#[test]
+fn lockfile_change_at_a_head_the_checkout_lacks_is_attributed() {
+    let monorepo = Monorepo::new(vec![
+        ws("svc")
+            .lockfile()
+            .package(pkg("core"))
+            .package(pkg("api").dep("core"))
+            .package(pkg("cli")),
+    ]);
+    let base = monorepo.commit("base");
+    let lockfile =
+        fs::read_to_string(monorepo.root().join("svc/Cargo.lock")).expect("read lockfile");
+    monorepo.write(
+        "svc/Cargo.lock",
+        &with_locked_dependency(&lockfile, "cli", "core"),
+    );
+    let head = monorepo.commit("head");
+    monorepo.write("svc/Cargo.lock", &lockfile);
+    monorepo.commit("checkout");
+    check_selection(
+        "lockfile_change_at_a_head_the_checkout_lacks_is_attributed",
+        &monorepo,
+        "",
+        &["--base", &base, "--head", &head],
+        &["svc/Cargo.lock"],
+        &Expect::exact(&[target("svc/cli")]).forbid_global_fail_wide(),
+    );
+}
+
+/// `svc/shared/embed.rs` embeds the lockfile and belongs to no package, so
+/// the index cannot tie it to `audit`, which includes it.
+#[test]
+fn lockfile_embedded_by_a_source_outside_every_package_widens_its_workspace() {
+    let monorepo = Monorepo::new(vec![
+        ws("svc")
+            .lockfile()
+            .file(
+                "shared/embed.rs",
+                "pub const LOCKFILE: &str = include_str!(\"../Cargo.lock\");\n",
+            )
+            .package(pkg("core"))
+            .package(pkg("cli").dep("core"))
+            .package(pkg("audit").lib_source("include!(\"../../shared/embed.rs\");\n")),
+    ]);
+    let lockfile = rewind_locked_dependency(&monorepo, "svc", "cli", "core");
+    check(
+        "lockfile_embedded_by_a_source_outside_every_package_widens_its_workspace",
+        monorepo,
+        &[edit("svc/Cargo.lock", &lockfile)],
+        &Expect::exact(&[target("svc/core"), target("svc/cli"), target("svc/audit")])
+            .require_command(CommandExpectation::new("svc", CommandMode::WorkspaceWide))
+            .forbid_global_fail_wide(),
+    );
+}
+
+/// An unattributed lockfile widens its own workspace and also selects
+/// `audit`, which embeds it from another workspace, even alongside a
+/// test-only edit in `helper`.
+#[test]
+fn unattributed_lockfile_selects_a_package_in_another_workspace_that_embeds_it() {
+    let monorepo = Monorepo::new(vec![
+        ws("svc").lockfile().package(pkg("core")),
+        ws("tools")
+            .package(pkg("audit").lib_source(
+                "pub const LOCKFILE: &str = include_str!(\"../../../svc/Cargo.lock\");\n",
+            ))
+            .package(pkg("helper").file("tests/smoke.rs", "#[test]\nfn smoke() {}\n")),
+    ]);
+    monorepo.commit("base");
+    check_selection(
+        "unattributed_lockfile_selects_a_package_in_another_workspace_that_embeds_it",
+        &monorepo,
+        "",
+        &["--files", "svc/Cargo.lock", "tools/helper/tests/smoke.rs"],
+        &["svc/Cargo.lock", "tools/helper/tests/smoke.rs"],
+        &Expect::exact(&[
+            target("svc/core"),
+            target("tools/audit"),
+            target("tools/helper"),
+        ])
+        .require_command(CommandExpectation::new("svc", CommandMode::WorkspaceWide))
+        .forbid_global_fail_wide(),
+    );
+}
+
+/// `helper/src/embed.rs` embeds the lockfile and `audit` mounts that file as
+/// a module without depending on `helper`, so both read the lockfile.
+#[test]
+fn lockfile_change_selects_every_package_that_compiles_an_embedding_source() {
+    let monorepo = Monorepo::new(vec![
+        ws("svc")
+            .lockfile()
+            .package(pkg("core"))
+            .package(pkg("cli").dep("core"))
+            .package(pkg("helper").file(
+                "src/embed.rs",
+                "pub const LOCKFILE: &str = include_str!(\"../../Cargo.lock\");\n",
+            ))
+            .package(
+                pkg("audit").lib_source("#[path = \"../../helper/src/embed.rs\"]\nmod embed;\n"),
+            ),
+    ]);
+    let lockfile = rewind_locked_dependency(&monorepo, "svc", "cli", "core");
+    check(
+        "lockfile_change_selects_every_package_that_compiles_an_embedding_source",
+        monorepo,
+        &[edit("svc/Cargo.lock", &lockfile)],
+        &Expect::exact(&[target("svc/cli"), target("svc/helper"), target("svc/audit")])
+            .forbid_global_fail_wide(),
+    );
+}
+
+/// Sources outside `--root` are not indexed, so a lockfile there cannot be
+/// attributed.
+#[test]
+fn lockfile_of_a_workspace_outside_the_root_widens_that_workspace() {
+    let monorepo = Monorepo::new(vec![
+        ws("svc").package(pkg("core")),
+        ws("other")
+            .lockfile()
+            .package(pkg("lib"))
+            .package(pkg("app").dep("lib")),
+    ]);
+    let lockfile = rewind_locked_dependency(&monorepo, "other", "app", "lib");
+    let base = monorepo.commit("base");
+    monorepo.write("other/Cargo.lock", &lockfile);
+    let head = monorepo.commit("head");
+    check_selection(
+        "lockfile_of_a_workspace_outside_the_root_widens_that_workspace",
+        &monorepo,
+        "svc",
+        &["--base", &base, "--head", &head],
+        &["other/Cargo.lock"],
+        &Expect::exact(&[target("other/lib"), target("other/app")])
+            .require_command(CommandExpectation::new("other", CommandMode::WorkspaceWide))
+            .forbid_global_fail_wide(),
+    );
+}
+
+/// A lockfile named with `--files` but unchanged over the measured range
+/// cannot be attributed.
+#[test]
+fn lockfile_named_as_changed_but_unchanged_over_the_range_widens_its_workspace() {
+    let monorepo = Monorepo::new(vec![
+        ws("svc")
+            .lockfile()
+            .package(pkg("core"))
+            .package(pkg("cli")),
+    ]);
+    monorepo.commit("base");
+    check_selection(
+        "lockfile_named_as_changed_but_unchanged_over_the_range_widens_its_workspace",
+        &monorepo,
+        "",
+        &["--worktree", "--files", "svc/Cargo.lock"],
+        &["svc/Cargo.lock"],
+        &Expect::exact(&[target("svc/core"), target("svc/cli")])
+            .require_command(CommandExpectation::new("svc", CommandMode::WorkspaceWide))
+            .forbid_global_fail_wide(),
+    );
+}
+
+/// Changed paths are relative to the repository, not to `--root`.
+#[test]
+fn lockfile_is_attributed_when_root_is_a_subdirectory() {
+    let monorepo = Monorepo::new(vec![
+        ws("svc")
+            .lockfile()
+            .package(pkg("core"))
+            .package(pkg("api").dep("core"))
+            .package(pkg("cli").dep("core")),
+    ]);
+    let lockfile = rewind_locked_dependency(&monorepo, "svc", "cli", "core");
+    let base = monorepo.commit("base");
+    monorepo.write("svc/Cargo.lock", &lockfile);
+    let head = monorepo.commit("head");
+    check_selection(
+        "lockfile_is_attributed_when_root_is_a_subdirectory",
+        &monorepo,
+        "svc",
+        &["--base", &base, "--head", &head],
+        &["svc/Cargo.lock"],
+        &Expect::exact(&[target("svc/cli")]).forbid_global_fail_wide(),
+    );
+}
+
+/// `lockfile` with an edge from `package`, which locks no dependencies, to
+/// `dependency`.
+fn with_locked_dependency(lockfile: &str, package: &str, dependency: &str) -> String {
+    let (entry, locked) = locked_edge(package, dependency);
+    assert!(lockfile.contains(&format!("{entry}\n")), "{lockfile}");
+    lockfile.replace(&entry, &locked)
+}
+
+/// `package`'s locked entry without and with its edge to `dependency`.
+fn locked_edge(package: &str, dependency: &str) -> (String, String) {
+    let entry = format!("name = \"{package}\"\nversion = \"0.1.0\"\n");
+    let locked = format!("{entry}dependencies = [\n \"{dependency}\",\n]\n");
+    (entry, locked)
 }
 
 /// ferris reports a workspace as affected without naming any crate, the shape a
